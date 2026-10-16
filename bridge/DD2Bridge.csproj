@@ -1,0 +1,69 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net472</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <AssemblyName>DD2Bridge</AssemblyName>
+    <RootNamespace>DD2Bridge</RootNamespace>
+
+    <!--
+      Portable game path configuration.
+
+      Either:
+        1) set the DD2_GAME_DIR environment variable, or
+        2) pass -p:DD2GameDir="..." to dotnet build.
+
+      Example:
+        $env:DD2_GAME_DIR = "C:\path\to\Darkest Dungeon II"
+        dotnet build -c Release -t:Rebuild
+    -->
+    <DD2GameDir Condition="'$(DD2GameDir)' == ''">$(DD2_GAME_DIR)</DD2GameDir>
+    <DD2ManagedDir Condition="'$(DD2ManagedDir)' == ''">$(DD2GameDir)\Darkest Dungeon II_Data\Managed</DD2ManagedDir>
+    <BepInExCoreDir Condition="'$(BepInExCoreDir)' == ''">$(DD2GameDir)\BepInEx\core</BepInExCoreDir>
+  </PropertyGroup>
+
+  <Target Name="ValidateDD2GameDir" BeforeTargets="ResolveReferences"
+          Condition="'$(DD2GameDir)' == ''">
+    <Error Text="DD2 game directory is not configured. Set the DD2_GAME_DIR environment variable or pass -p:DD2GameDir=&quot;C:\path\to\Darkest Dungeon II&quot;." />
+  </Target>
+
+  <ItemGroup>
+    <Reference Include="BepInEx">
+      <HintPath>$(BepInExCoreDir)\BepInEx.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+
+    <Reference Include="0Harmony">
+      <HintPath>$(BepInExCoreDir)\0Harmony.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+
+    <Reference Include="UnityEngine">
+      <HintPath>$(DD2ManagedDir)\UnityEngine.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+
+    <Reference Include="UnityEngine.CoreModule">
+      <HintPath>$(DD2ManagedDir)\UnityEngine.CoreModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+
+    <Reference Include="UnityEngine.UI">
+      <HintPath>$(DD2ManagedDir)\UnityEngine.UI.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+
+    <Reference Include="IronCrown">
+      <HintPath>$(DD2ManagedDir)\IronCrown.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+
+    <Reference Include="Newtonsoft.Json">
+      <HintPath>$(DD2ManagedDir)\Newtonsoft.Json.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+</Project>

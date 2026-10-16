@@ -1,0 +1,14 @@
+bin/
+obj/
+.vs/
+*.user
+*.suo
+*.log
+__pycache__/
+*.pyc
+*.bak
+*.zip
+*-backup-*
+*-watchdog-backup-*
+snapshot*
+BeforeOptimization*

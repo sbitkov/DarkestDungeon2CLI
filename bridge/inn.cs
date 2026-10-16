@@ -1,4 +1,6 @@
 ﻿using Assets.Code.Game;
+using Assets.Code.Inn;
+using Assets.Code.Utils;
 using Newtonsoft.Json.Linq;
 
 namespace DD2Bridge
@@ -44,6 +46,18 @@ namespace DD2Bridge
                         new JObject
                         {
                             ["action"] = "inn_items"
+                        },
+                        new JObject
+                        {
+                            ["action"] = "embark",
+                            ["available"] =
+                                Singleton<InnBhv>.Instance != null &&
+                                Singleton<InnBhv>.Instance.GetCanEmbark(),
+                            ["blocked_reason"] =
+                                (Singleton<InnBhv>.Instance != null &&
+                                 Singleton<InnBhv>.Instance.GetCanEmbark())
+                                    ? null
+                                    : "no_route_selected"
                         }
                     }
             };
@@ -65,6 +79,17 @@ namespace DD2Bridge
             {
                 _innReadySent = false;
                 return;
+            }
+
+            if (_innEmbarkReturnPending)
+            {
+                if (_confirmationChoiceInFlight != null)
+                {
+                    return;
+                }
+
+                _innEmbarkReturnPending = false;
+                _innReadySent = false;
             }
 
             if (_innReadySent)

@@ -915,6 +915,7 @@ def read_command(session_state=None):
             "post_combat_loot_confirmation",
             "end_expedition_confirmation",
             "stagecoach_equip_confirmation",
+            "inn_embark_confirmation",
         }:
             if text == "confirm":
                 return {
@@ -1394,6 +1395,67 @@ def read_command(session_state=None):
 
         if frontend_state == "inn" and text in {"inn_items", "items", "rest_items"}:
             return {"type": "command", "action": "inn_items"}
+
+        if frontend_state == "inn" and text in {"embark", "depart", "leave_inn"}:
+            embark_action = next(
+                (
+                    action
+                    for action in (snapshot.get("available_actions") or [])
+                    if isinstance(action, dict)
+                    and action.get("action") == "embark"
+                ),
+                None,
+            )
+            if isinstance(embark_action, dict) and embark_action.get("available") is False:
+                reason = embark_action.get("blocked_reason") or "unavailable"
+                print(f"Embark is currently blocked: {reason}")
+                continue
+            return {"type": "command", "action": "embark"}
+
+        if frontend_state == "embark_relationships":
+            reveal_match = re.fullmatch(
+                r"(?:reveal|reveal_relationship)\s+(\d+)\s+(\d+)",
+                text,
+            )
+            if reveal_match:
+                actor_a = int(reveal_match.group(1))
+                actor_b = int(reveal_match.group(2))
+                requested = {actor_a, actor_b}
+                valid_pairs = {
+                    frozenset(int(x) for x in (action.get("actor_guids") or []))
+                    for action in (snapshot.get("available_actions") or [])
+                    if isinstance(action, dict)
+                    and action.get("action") == "reveal_relationship"
+                    and len(action.get("actor_guids") or []) == 2
+                }
+                if frozenset(requested) not in valid_pairs:
+                    print("That relationship is not currently available to reveal.")
+                    continue
+                return {
+                    "type": "command",
+                    "action": "reveal_relationship",
+                    "actor_guids": [actor_a, actor_b],
+                }
+
+            if text in {"continue_embark", "continue", "depart"}:
+                can_continue = any(
+                    isinstance(action, dict)
+                    and action.get("action") == "continue_embark"
+                    for action in (snapshot.get("available_actions") or [])
+                )
+                if not can_continue:
+                    print("Reveal all relationships before continuing.")
+                    continue
+                return {
+                    "type": "command",
+                    "action": "continue_embark",
+                }
+
+            print(
+                "EMBARK commands: reveal <actor_guid> <actor_guid>, "
+                "continue_embark, state, raw_actions, quit"
+            )
+            continue
 
         if frontend_state == "inn_items":
             if text in {"inn_items", "items", "refresh"}:
@@ -2327,6 +2389,97 @@ def print_frontend_snapshot(message, heading):
     current_mode = message.get("current_mode")
     if current_mode:
         print(f"Current mode: {current_mode}")
+
+    if frontend_state == "embark_relationships":
+        next_biome_name = message.get("next_biome_name") or ""
+        next_biome_id = message.get("next_biome_id") or ""
+        if next_biome_name or next_biome_id:
+            label = next_biome_name or next_biome_id
+            if next_biome_name and next_biome_id and next_biome_name != next_biome_id:
+                label += f" [{next_biome_id}]"
+            print()
+            print(f"Next region: {label}")
+
+        relationships = message.get("relationships") or []
+        print()
+        print("Relationships:")
+        if not relationships:
+            print("  none formed this embark")
+
+        for card in relationships:
+            if not isinstance(card, dict):
+                continue
+
+            actors = card.get("actors") or []
+            actor_labels = []
+            for actor in actors:
+                if not isinstance(actor, dict):
+                    continue
+                guid = actor.get("actor_guid")
+                name = actor.get("actor_name") or ""
+                actor_id = actor.get("actor_data_id") or ""
+                label = f"[{guid}]"
+                if name:
+                    label += f" {name}"
+                if actor_id:
+                    label += f" ({actor_id})"
+                actor_labels.append(label)
+
+            pair_text = " + ".join(actor_labels) if actor_labels else "<unknown pair>"
+            index = card.get("index")
+
+            if not card.get("revealed"):
+                print(f"  {index}. {pair_text}: [UNREVEALED]")
+                continue
+
+            relationship_id = card.get("relationship_id") or "<unknown>"
+            relationship_name = _clean_skill_text(card.get("relationship_name"))
+            relation_label = relationship_name or relationship_id
+            if relationship_name and relationship_name != relationship_id:
+                relation_label += f" [{relationship_id}]"
+            if card.get("positive"):
+                relation_label += " [POSITIVE]"
+            elif card.get("negative"):
+                relation_label += " [NEGATIVE]"
+
+            print(f"  {index}. {pair_text}: {relation_label}")
+
+            for modified in card.get("modified_skills") or []:
+                if not isinstance(modified, dict):
+                    continue
+                actor_guid = modified.get("actor_guid")
+                skill = modified.get("skill")
+                if not isinstance(skill, dict):
+                    print(f"      [{actor_guid}] modified skill: none")
+                    continue
+                skill_id = skill.get("skill_id") or "<unknown>"
+                skill_info = skill.get("skill_info") or {}
+                skill_name = _clean_skill_text(
+                    skill_info.get("name") if isinstance(skill_info, dict) else ""
+                )
+                print(
+                    f"      [{actor_guid}] modified skill: "
+                    f"{skill_name or skill_id} [{skill_id}]"
+                )
+                _print_skill_info(skill_info, indent="        ")
+
+        print()
+        print("Commands:")
+        for action in message.get("available_actions") or []:
+            if not isinstance(action, dict):
+                continue
+            name = action.get("action")
+            if name == "reveal_relationship":
+                guids = action.get("actor_guids") or []
+                if len(guids) == 2:
+                    print(f"  reveal {guids[0]} {guids[1]}")
+            elif name == "continue_embark":
+                print("  continue_embark")
+        print("  state")
+        print("  raw_actions")
+        print("  quit")
+        print()
+        return
 
     if frontend_state == "inn_items":
         print()
@@ -3386,6 +3539,9 @@ def print_frontend_snapshot(message, heading):
                         if action.get("qty") is not None:
                             action_name += f" x{action['qty']}"
                         action_name += ")"
+                if action.get("available") is False:
+                    reason = action.get("blocked_reason") or "unavailable"
+                    action_name += f" [BLOCKED: {reason}]"
             else:
                 action_name = str(action)
 

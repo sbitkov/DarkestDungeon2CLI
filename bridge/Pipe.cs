@@ -228,6 +228,21 @@ namespace DD2Bridge
             {
                 HandleConfirmationChoice(request, false);
             }
+            else if (request.Command == "inn-embark")
+            {
+                HandleInnEmbark(request);
+            }
+            else if (request.Command.StartsWith("embark-reveal-relationship "))
+            {
+                HandleEmbarkRevealRelationship(
+                    request,
+                    request.Command.Substring(
+                        "embark-reveal-relationship ".Length));
+            }
+            else if (request.Command == "embark-continue")
+            {
+                HandleEmbarkContinue(request);
+            }
             else if (request.Command.StartsWith("post-combat-loot-take-item "))
             {
                 HandlePostCombatLootTakeItem(
@@ -845,6 +860,11 @@ namespace DD2Bridge
                     $"READY catch-up: actor={combatReady["current_actor_guid"]}");
 
                 QueueOutgoingMessage(combatReady);
+                return;
+            }
+
+            if (TryProcessEmbarkRelationshipsCatchup())
+            {
                 return;
             }
 
@@ -2016,6 +2036,69 @@ namespace DD2Bridge
                         Command =
                             "equipment-unequip-combat-item " +
                             actorGuid
+                    });
+                return;
+            }
+
+            if (action == "embark")
+            {
+                Logger.LogInfo("COMMAND inn: embark");
+                _requests.Enqueue(
+                    new BridgeRequest
+                    {
+                        Command = "inn-embark"
+                    });
+                return;
+            }
+
+            if (action == "reveal_relationship")
+            {
+                JArray actorGuids = message["actor_guids"] as JArray;
+                uint actorGuidA;
+                uint actorGuidB;
+
+                if (actorGuids == null ||
+                    actorGuids.Count != 2 ||
+                    !uint.TryParse(actorGuids[0].ToString(), out actorGuidA) ||
+                    !uint.TryParse(actorGuids[1].ToString(), out actorGuidB) ||
+                    actorGuidA == 0u ||
+                    actorGuidB == 0u ||
+                    actorGuidA == actorGuidB)
+                {
+                    QueueOutgoingMessage(
+                        new JObject
+                        {
+                            ["type"] = "error",
+                            ["code"] = "invalid_command",
+                            ["message"] =
+                                "reveal_relationship requires exactly two actor_guids"
+                        });
+                    return;
+                }
+
+                Logger.LogInfo(
+                    $"COMMAND embark_relationships: reveal_relationship " +
+                    $"actors={actorGuidA},{actorGuidB}");
+
+                _requests.Enqueue(
+                    new BridgeRequest
+                    {
+                        Command =
+                            "embark-reveal-relationship " +
+                            actorGuidA + " " + actorGuidB
+                    });
+                return;
+            }
+
+            if (action == "continue_embark")
+            {
+                Logger.LogInfo(
+                    "COMMAND embark_relationships: continue_embark");
+
+                _requests.Enqueue(
+                    new BridgeRequest
+                    {
+                        Command = "embark-continue"
                     });
                 return;
             }

@@ -45,7 +45,7 @@ namespace DD2Bridge
     [BepInPlugin("dd2.agent.bridge", "DD2 Agent Bridge", BridgeVersion)]
     public sealed partial class DD2BridgePlugin : BaseUnityPlugin
     {
-        private const string BridgeVersion = "0.0.55";
+        private const string BridgeVersion = "0.0.56";
         private string _lastState;
         private Thread _pipeThread;
         private volatile bool _pipeRunning;
@@ -275,12 +275,26 @@ namespace DD2Bridge
 
             GameModeType mode = GameModeMgr.CurrentMode;
 
+            if (mode != GameModeType.EMBARK)
+            {
+                _embarkReadySent = false;
+            }
+
             // COMBAT has absolute frontend priority. Road combats can keep
             // DRIVING objects alive underneath them, so no passive driving
             // frontend may overwrite a combat READY while Battle is running.
             if (IsCombatForegroundActive())
             {
                 ResetStagecoachReadyBoundary();
+                return;
+            }
+
+            // The embark relationship screen owns the whole foreground.
+            // Inn inventory objects can survive briefly into the mode switch,
+            // so detect EMBARK before the generic inventory frontend.
+            if (mode == GameModeType.EMBARK)
+            {
+                ProcessEmbarkRelationshipsReady();
                 return;
             }
 

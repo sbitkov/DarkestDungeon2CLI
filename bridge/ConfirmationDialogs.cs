@@ -99,6 +99,19 @@ namespace DD2Bridge
                     reason = "abandon_existing_expedition";
                     return true;
 
+                case CommonUiBhv.ConfirmationDialogType.InnEmbark:
+                    if (string.Equals(
+                        _pendingConfirmationContext,
+                        ConfirmationContextInnEmbark,
+                        StringComparison.Ordinal))
+                    {
+                        frontendState = "inn_embark_confirmation";
+                        reason = "leave_inn";
+                        return true;
+                    }
+
+                    return false;
+
                 case CommonUiBhv.ConfirmationDialogType.AbandonRun:
                     if (string.Equals(
                         _pendingConfirmationContext,
@@ -415,6 +428,10 @@ namespace DD2Bridge
             {
                 _innReadySent = true;
             }
+            else if (frontendState == "inn_embark_confirmation")
+            {
+                _innReadySent = true;
+            }
 
             Logger.LogInfo(
                 $"READY {frontendState}: {ready["reason"]} " +
@@ -448,6 +465,12 @@ namespace DD2Bridge
                 $"{(confirm ? "confirm" : "cancel")} " +
                 $"dialog_type={dialogType} " +
                 $"key='{_activeConfirmationSemanticKey}'");
+
+            if (confirm &&
+                frontendState == "inn_embark_confirmation")
+            {
+                QueueActivityStatus("leaving inn");
+            }
 
             if (confirm)
             {
@@ -504,6 +527,14 @@ namespace DD2Bridge
                     // Return to the run-end summary after the native modal has
                     // actually finished closing.
                     _innEndExpeditionReturnPending = true;
+                }
+                else if (frontendState == "inn_embark_confirmation" &&
+                         GameModeMgr.CurrentMode == GameModeType.INN)
+                {
+                    // Declining departure returns to the normal Inn hub, but
+                    // wait for the pooled native confirmation to finish its
+                    // close lifecycle before re-announcing INN.
+                    _innEmbarkReturnPending = true;
                 }
             }
 

@@ -1,0 +1,24 @@
+DarkestDungeon2CLI Linking Exception
+
+Copyright (C) 2026 Sergey Bitkov
+
+This project is licensed under the GNU General Public License, version 3 only.
+
+Additional permission under GNU GPL version 3 section 7:
+
+You may link, combine, load, or otherwise use this Program with proprietary
+libraries and runtime components that are distributed as part of, or required
+to run, Darkest Dungeon II, including IronCrown.dll and the Unity runtime
+libraries used by the game.
+
+You may convey the resulting work without applying the GNU General Public
+License to those proprietary libraries or runtime components themselves.
+
+This exception does not grant permission to copy, redistribute, modify,
+relicense, or otherwise exercise rights in Darkest Dungeon II, its libraries,
+assets, data, or other copyrighted materials beyond the permissions granted
+by their respective copyright holders and licenses.
+
+The GNU General Public License version 3 continues to apply to this Program
+and to modifications of this Program, except for the additional permission
+stated above.

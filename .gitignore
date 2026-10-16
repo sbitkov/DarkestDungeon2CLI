@@ -11,4 +11,5 @@ __pycache__/
 *-backup-*
 *-watchdog-backup-*
 snapshot*
-BeforeOptimization*
+BeforeOptimization*bridge/README-REFACTOR.md
+bridge/commands.txt

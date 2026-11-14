@@ -53,18 +53,138 @@ namespace DD2Bridge
                 new ManualResetEventSlim(false);
         }
 
+        // Keep Unity independent from the transport writer. These limits bound
+        // retained serialized JSON even if the host stops reading.
+        private const int MaxPendingCommands = 128;
+        private const int MaxOutgoingMessages = 512;
+        private const int MaxOutgoingCharacters = 4 * 1024 * 1024;
+        private const int MaxSingleOutgoingCharacters = 256 * 1024;
+
         private readonly ConcurrentQueue<BridgeRequest> _requests =
             new ConcurrentQueue<BridgeRequest>();
-            
+
         private readonly ConcurrentQueue<string> _outgoingMessages =
             new ConcurrentQueue<string>();
+        private readonly object _outgoingQueueLock = new object();
+        private int _outgoingCharacters;
+        private volatile bool _pipeClientConnected;
+        private volatile bool _outgoingOverflowed;
+
+        private readonly object _incomingQueueLock = new object();
+
+        private bool QueueIncomingRequest(BridgeRequest request)
+        {
+            // Queue admission and dequeue must share a lock: Count followed by
+            // Enqueue without synchronization is not an atomic capacity check.
+            lock (_incomingQueueLock)
+            {
+                if (_requests.Count < MaxPendingCommands)
+                {
+                    _requests.Enqueue(request);
+                    return true;
+                }
+            }
+
+            QueueOutgoingMessage(new JObject
+            {
+                ["type"] = "error",
+                ["code"] = "command_queue_full",
+                ["message"] = "Bridge command backlog is full; retry later"
+            });
+            return false;
+        }
+
+        private void DiscardPendingRequests()
+        {
+            int count = 0;
+            lock (_incomingQueueLock)
+            {
+                BridgeRequest ignored;
+                while (_requests.TryDequeue(out ignored))
+                {
+                    ignored.Response = "ERROR: transport session ended";
+                    ignored.Completed.Set();
+                    count++;
+                }
+            }
+
+            if (count > 0)
+            {
+                Logger.LogWarning(
+                    $"PIPE: discarded {count} commands from disconnected session");
+            }
+        }
 
         private void QueueOutgoingMessage(JObject message)
         {
-            AugmentStagecoachReadyWithEquipment(message);
+            // Disconnected-session events were already discarded on reconnect.
+            // Reconnect catch-up sends a new authoritative READY snapshot.
+            if (!_pipeClientConnected || _outgoingOverflowed)
+            {
+                return;
+            }
 
-            _outgoingMessages.Enqueue(
-                message.ToString(Newtonsoft.Json.Formatting.None));
+            AugmentStagecoachReadyWithEquipment(message);
+            string payload =
+                message.ToString(Newtonsoft.Json.Formatting.None);
+
+            bool overflowedNow = false;
+            lock (_outgoingQueueLock)
+            {
+                if (!_pipeClientConnected || _outgoingOverflowed)
+                {
+                    return;
+                }
+
+                if (payload.Length > MaxSingleOutgoingCharacters ||
+                    _outgoingMessages.Count >= MaxOutgoingMessages ||
+                    (long)_outgoingCharacters + payload.Length > MaxOutgoingCharacters)
+                {
+                    _outgoingOverflowed = true;
+                    overflowedNow = true;
+                }
+                else
+                {
+                    _outgoingMessages.Enqueue(payload);
+                    _outgoingCharacters += payload.Length;
+                }
+            }
+
+            if (overflowedNow)
+            {
+                // Do not silently discard combat consequences and keep talking
+                // to the host. Abort this session with an explicit fatal frame.
+                Logger.LogError(
+                    "PIPE: outgoing queue overflow; disconnecting host to avoid " +
+                    "continuing with an incomplete semantic event stream");
+            }
+        }
+
+        private bool TryDequeueOutgoing(out string payload)
+        {
+            lock (_outgoingQueueLock)
+            {
+                if (!_outgoingMessages.TryDequeue(out payload))
+                {
+                    return false;
+                }
+
+                _outgoingCharacters -= payload.Length;
+                return true;
+            }
+        }
+
+        private void DiscardOutgoing()
+        {
+            lock (_outgoingQueueLock)
+            {
+                string ignored;
+                while (_outgoingMessages.TryDequeue(out ignored))
+                {
+                }
+
+                _outgoingCharacters = 0;
+            }
         }
 
         private void OnApplicationQuit()
@@ -95,9 +215,12 @@ namespace DD2Bridge
         {
             BridgeRequest request;
 
-            if (!_requests.TryDequeue(out request))
+            lock (_incomingQueueLock)
             {
-                return;
+                if (!_requests.TryDequeue(out request))
+                {
+                    return;
+                }
             }
 
             try
@@ -785,13 +908,14 @@ namespace DD2Bridge
 
                     // A new transport session must not inherit messages that
                     // were queued for a previous disconnected host.
-                    string staleOutgoing;
-                    int staleCount = 0;
-
-                    while (_outgoingMessages.TryDequeue(out staleOutgoing))
+                    int staleCount;
+                    lock (_outgoingQueueLock)
                     {
-                        staleCount++;
+                        staleCount = _outgoingMessages.Count;
                     }
+                    DiscardOutgoing();
+                    _outgoingOverflowed = false;
+                    _pipeClientConnected = true;
 
                     if (staleCount > 0)
                     {
@@ -838,7 +962,20 @@ namespace DD2Bridge
                         {
                             string outgoing;
 
-                            while (_outgoingMessages.TryDequeue(out outgoing))
+                            if (_outgoingOverflowed)
+                            {
+                                writer.WriteLine(new JObject
+                                {
+                                    ["type"] = "error",
+                                    ["code"] = "fatal_transport_overflow",
+                                    ["message"] = "Bridge event backlog overflowed; " +
+                                        "event history is incomplete. Reconnect to resync."
+                                }.ToString(Newtonsoft.Json.Formatting.None));
+                                break;
+                            }
+
+                            while (!_outgoingOverflowed &&
+                                TryDequeueOutgoing(out outgoing))
                             {
                                 writer.WriteLine(outgoing);
                             }
@@ -894,6 +1031,11 @@ namespace DD2Bridge
                 }
                 finally
                 {
+                    _pipeClientConnected = false;
+                    DiscardPendingRequests();
+                    DiscardOutgoing();
+                    _outgoingOverflowed = false;
+
                     if (_activePipe != null)
                     {
                         _activePipe.Dispose();
@@ -1182,6 +1324,20 @@ namespace DD2Bridge
         
         private void HandleIncomingPipeMessage(string line)
         {
+            // Input size must not turn into arbitrarily large retained commands.
+            // A line is already read at this point; the cap prevents parsing,
+            // queueing and further allocations from oversized input.
+            if (line == null || line.Length > 64 * 1024)
+            {
+                QueueOutgoingMessage(new JObject
+                {
+                    ["type"] = "error",
+                    ["code"] = "command_too_large",
+                    ["message"] = "Command exceeds the 64 Ki-character limit"
+                });
+                return;
+            }
+
             //Logger.LogInfo($"PIPE RX: {line}");
             
             JObject message;
@@ -1221,10 +1377,11 @@ namespace DD2Bridge
 
             string action = (string)message["action"];
 
+
             if (action == "map")
             {
                 Logger.LogInfo("COMMAND driving: map");
-                _requests.Enqueue(
+                QueueIncomingRequest(
                     new BridgeRequest
                     {
                         Command = "map-state"
@@ -1236,7 +1393,7 @@ namespace DD2Bridge
             {
                 Logger.LogInfo("COMMAND state");
 
-                _requests.Enqueue(
+                QueueIncomingRequest(
                     new BridgeRequest
                     {
                         Command = "current-state"
@@ -1248,7 +1405,7 @@ namespace DD2Bridge
             if (action == "enter_node")
             {
                 Logger.LogInfo("COMMAND node_entry: enter_node");
-                _requests.Enqueue(
+                QueueIncomingRequest(
                     new BridgeRequest
                     {
                         Command = "node-entry-enter"
@@ -1259,7 +1416,7 @@ namespace DD2Bridge
             if (action == "leave_altar")
             {
                 Logger.LogInfo("COMMAND altar_of_hope: leave_altar");
-                _requests.Enqueue(
+                QueueIncomingRequest(
                     new BridgeRequest
                     {
                         Command = "altar-of-hope-leave"
@@ -1288,7 +1445,7 @@ namespace DD2Bridge
 
                 Logger.LogInfo(
                     $"COMMAND boss_select: select_boss boss_id='{bossId}'");
-                _requests.Enqueue(
+                QueueIncomingRequest(
                     new BridgeRequest
                     {
                         Command = "boss-select-select " + bossId
@@ -1317,7 +1474,7 @@ namespace DD2Bridge
 
                 Logger.LogInfo(
                     $"COMMAND hero_management: inspect_hero actor={actorGuid}");
-                _requests.Enqueue(
+                QueueIncomingRequest(
                     new BridgeRequest
                     {
                         Command = "hero-management-inspect " + actorGuid
@@ -1330,7 +1487,7 @@ namespace DD2Bridge
                 Logger.LogInfo(
                     "COMMAND hero_select: confirm_party");
 
-                _requests.Enqueue(
+                QueueIncomingRequest(
                     new BridgeRequest
                     {
                         Command = "hero-select-confirm-party"
@@ -1342,7 +1499,7 @@ namespace DD2Bridge
             {
                 Logger.LogInfo("COMMAND confirmation: confirm");
 
-                _requests.Enqueue(
+                QueueIncomingRequest(
                     new BridgeRequest
                     {
                         Command = "confirmation-confirm"
@@ -1354,7 +1511,7 @@ namespace DD2Bridge
             {
                 Logger.LogInfo("COMMAND confirmation: cancel");
 
-                _requests.Enqueue(
+                QueueIncomingRequest(
                     new BridgeRequest
                     {
                         Command = "confirmation-cancel"
@@ -1389,7 +1546,7 @@ namespace DD2Bridge
                 Logger.LogInfo(
                     $"COMMAND hero_select: set_party_member slot={slotIndex} actor={actorGuid}");
 
-                _requests.Enqueue(
+                QueueIncomingRequest(
                     new BridgeRequest
                     {
                         Command =
@@ -1423,7 +1580,7 @@ namespace DD2Bridge
                 Logger.LogInfo(
                     $"COMMAND hero_select: clear_party_slot slot={slotIndex}");
 
-                _requests.Enqueue(
+                QueueIncomingRequest(
                     new BridgeRequest
                     {
                         Command =
@@ -1461,7 +1618,7 @@ namespace DD2Bridge
 
                 Logger.LogInfo(
                     $"COMMAND hero_select: set_hero_path actor={actorGuid} path='{pathId}'");
-                _requests.Enqueue(
+                QueueIncomingRequest(
                     new BridgeRequest
                     {
                         Command =
@@ -1527,7 +1684,7 @@ namespace DD2Bridge
                     command += " " + string.Join(" ", skillIds.ToArray());
                 }
 
-                _requests.Enqueue(
+                QueueIncomingRequest(
                     new BridgeRequest
                     {
                         Command = command
@@ -1538,7 +1695,7 @@ namespace DD2Bridge
             if (action == "hospital_state")
             {
                 Logger.LogInfo("COMMAND hospital: hospital_state");
-                _requests.Enqueue(
+                QueueIncomingRequest(
                     new BridgeRequest
                     {
                         Command = "hospital-state"
@@ -1567,7 +1724,7 @@ namespace DD2Bridge
 
                 Logger.LogInfo(
                     $"COMMAND hospital: select_actor actor={actorGuid}");
-                _requests.Enqueue(
+                QueueIncomingRequest(
                     new BridgeRequest
                     {
                         Command = "hospital-select-actor " + actorGuid
@@ -1591,7 +1748,7 @@ namespace DD2Bridge
                 }
 
                 Logger.LogInfo($"COMMAND hospital: tab '{tab}'");
-                _requests.Enqueue(
+                QueueIncomingRequest(
                     new BridgeRequest
                     {
                         Command = "hospital-tab " + tab
@@ -1617,7 +1774,7 @@ namespace DD2Bridge
 
                 Logger.LogInfo(
                     $"COMMAND hospital: select_quirk '{quirkId}'");
-                _requests.Enqueue(
+                QueueIncomingRequest(
                     new BridgeRequest
                     {
                         Command = "hospital-select-quirk " + quirkId
@@ -1627,35 +1784,35 @@ namespace DD2Bridge
 
             if (action == "hospital_minor_heal")
             {
-                _requests.Enqueue(
+                QueueIncomingRequest(
                     new BridgeRequest { Command = "hospital-minor-heal" });
                 return;
             }
 
             if (action == "hospital_full_heal")
             {
-                _requests.Enqueue(
+                QueueIncomingRequest(
                     new BridgeRequest { Command = "hospital-full-heal" });
                 return;
             }
 
             if (action == "hospital_cure_disease")
             {
-                _requests.Enqueue(
+                QueueIncomingRequest(
                     new BridgeRequest { Command = "hospital-cure-disease" });
                 return;
             }
 
             if (action == "hospital_lock_quirk")
             {
-                _requests.Enqueue(
+                QueueIncomingRequest(
                     new BridgeRequest { Command = "hospital-lock-quirk" });
                 return;
             }
 
             if (action == "hospital_remove_quirk")
             {
-                _requests.Enqueue(
+                QueueIncomingRequest(
                     new BridgeRequest { Command = "hospital-remove-quirk" });
                 return;
             }
@@ -1679,7 +1836,7 @@ namespace DD2Bridge
                     return;
                 }
 
-                _requests.Enqueue(
+                QueueIncomingRequest(
                     new BridgeRequest
                     {
                         Command = "hospital-buy " + slot
@@ -1689,7 +1846,7 @@ namespace DD2Bridge
 
             if (action == "leave_hospital")
             {
-                _requests.Enqueue(
+                QueueIncomingRequest(
                     new BridgeRequest { Command = "hospital-leave" });
                 return;
             }
@@ -1697,7 +1854,7 @@ namespace DD2Bridge
             if (action == "store_state")
             {
                 Logger.LogInfo("COMMAND store: store_state");
-                _requests.Enqueue(
+                QueueIncomingRequest(
                     new BridgeRequest
                     {
                         Command = "store-state"
@@ -1725,7 +1882,7 @@ namespace DD2Bridge
                 }
 
                 Logger.LogInfo($"COMMAND store: buy slot={slot}");
-                _requests.Enqueue(
+                QueueIncomingRequest(
                     new BridgeRequest
                     {
                         Command = "store-buy " + slot
@@ -1736,7 +1893,7 @@ namespace DD2Bridge
             if (action == "leave")
             {
                 Logger.LogInfo("COMMAND store: leave");
-                _requests.Enqueue(
+                QueueIncomingRequest(
                     new BridgeRequest
                     {
                         Command = "store-leave"
@@ -1766,7 +1923,7 @@ namespace DD2Bridge
                 Logger.LogInfo(
                     $"COMMAND post_combat_loot: take_item slot={slot}");
 
-                _requests.Enqueue(
+                QueueIncomingRequest(
                     new BridgeRequest
                     {
                         Command = "post-combat-loot-take-item " + slot
@@ -1778,7 +1935,7 @@ namespace DD2Bridge
             {
                 Logger.LogInfo("COMMAND post_combat_loot: take_all");
 
-                _requests.Enqueue(
+                QueueIncomingRequest(
                     new BridgeRequest
                     {
                         Command = "post-combat-loot-take-all"
@@ -1789,7 +1946,7 @@ namespace DD2Bridge
             if (action == "inventory")
             {
                 Logger.LogInfo("COMMAND semantic: inventory");
-                _requests.Enqueue(
+                QueueIncomingRequest(
                     new BridgeRequest
                     {
                         Command = "inventory-state"
@@ -1816,7 +1973,7 @@ namespace DD2Bridge
                 }
 
                 Logger.LogInfo($"COMMAND inventory: discard_item slot={slot}");
-                _requests.Enqueue(
+                QueueIncomingRequest(
                     new BridgeRequest
                     {
                         Command = "inventory-discard " + slot
@@ -1827,7 +1984,7 @@ namespace DD2Bridge
             if (action == "close_inventory")
             {
                 Logger.LogInfo("COMMAND inventory: close_inventory");
-                _requests.Enqueue(
+                QueueIncomingRequest(
                     new BridgeRequest
                     {
                         Command = "inventory-close"
@@ -1838,7 +1995,7 @@ namespace DD2Bridge
             if (action == "start_driving")
             {
                 Logger.LogInfo("COMMAND stagecoach_ready: start_driving");
-                _requests.Enqueue(
+                QueueIncomingRequest(
                     new BridgeRequest
                     {
                         Command = "stagecoach-start-driving"
@@ -1849,7 +2006,7 @@ namespace DD2Bridge
             if (action == "stop_driving")
             {
                 Logger.LogInfo("COMMAND driving: stop_driving");
-                _requests.Enqueue(
+                QueueIncomingRequest(
                     new BridgeRequest
                     {
                         Command = "stagecoach-stop-driving"
@@ -1882,7 +2039,7 @@ namespace DD2Bridge
                 Logger.LogInfo(
                     $"COMMAND story_choice: choose_story actor={actorGuid}");
 
-                _requests.Enqueue(
+                QueueIncomingRequest(
                     new BridgeRequest
                     {
                         Command =
@@ -1917,7 +2074,7 @@ namespace DD2Bridge
                 Logger.LogInfo(
                     $"COMMAND route_choice: choose_route option={optionIndex}");
 
-                _requests.Enqueue(
+                QueueIncomingRequest(
                     new BridgeRequest
                     {
                         Command =
@@ -1956,7 +2113,7 @@ namespace DD2Bridge
                     $"COMMAND stagecoach_ready: move_party_member " +
                     $"actor={actorGuid} slot={slot}");
 
-                _requests.Enqueue(
+                QueueIncomingRequest(
                     new BridgeRequest
                     {
                         Command =
@@ -1971,7 +2128,7 @@ namespace DD2Bridge
             if (action == "equipment_state")
             {
                 Logger.LogInfo("COMMAND stagecoach_ready: equipment_state");
-                _requests.Enqueue(
+                QueueIncomingRequest(
                     new BridgeRequest
                     {
                         Command = "equipment-state"
@@ -2014,7 +2171,7 @@ namespace DD2Bridge
                     $"actor={actorGuid} player_slot={playerSlot} " +
                     $"trinket_slot={trinketSlot}");
 
-                _requests.Enqueue(
+                QueueIncomingRequest(
                     new BridgeRequest
                     {
                         Command =
@@ -2055,7 +2212,7 @@ namespace DD2Bridge
                     $"COMMAND stagecoach_ready: unequip_trinket " +
                     $"actor={actorGuid} trinket_slot={trinketSlot}");
 
-                _requests.Enqueue(
+                QueueIncomingRequest(
                     new BridgeRequest
                     {
                         Command =
@@ -2095,7 +2252,7 @@ namespace DD2Bridge
                     $"COMMAND stagecoach_ready: equip_combat_item " +
                     $"actor={actorGuid} player_slot={playerSlot}");
 
-                _requests.Enqueue(
+                QueueIncomingRequest(
                     new BridgeRequest
                     {
                         Command =
@@ -2130,7 +2287,7 @@ namespace DD2Bridge
                     $"COMMAND stagecoach_ready: unequip_combat_item " +
                     $"actor={actorGuid}");
 
-                _requests.Enqueue(
+                QueueIncomingRequest(
                     new BridgeRequest
                     {
                         Command =
@@ -2143,7 +2300,7 @@ namespace DD2Bridge
             if (action == "embark")
             {
                 Logger.LogInfo("COMMAND inn: embark");
-                _requests.Enqueue(
+                QueueIncomingRequest(
                     new BridgeRequest
                     {
                         Command = "inn-embark"
@@ -2180,7 +2337,7 @@ namespace DD2Bridge
                     $"COMMAND embark_relationships: reveal_relationship " +
                     $"actors={actorGuidA},{actorGuidB}");
 
-                _requests.Enqueue(
+                QueueIncomingRequest(
                     new BridgeRequest
                     {
                         Command =
@@ -2195,7 +2352,7 @@ namespace DD2Bridge
                 Logger.LogInfo(
                     "COMMAND embark_relationships: continue_embark");
 
-                _requests.Enqueue(
+                QueueIncomingRequest(
                     new BridgeRequest
                     {
                         Command = "embark-continue"
@@ -2206,7 +2363,7 @@ namespace DD2Bridge
             if (action == "travelogue")
             {
                 Logger.LogInfo("COMMAND inn: travelogue");
-                _requests.Enqueue(
+                QueueIncomingRequest(
                     new BridgeRequest
                     {
                         Command = "inn-travelogue-state"
@@ -2217,7 +2374,7 @@ namespace DD2Bridge
             if (action == "end_expedition")
             {
                 Logger.LogInfo("COMMAND inn: end_expedition");
-                _requests.Enqueue(
+                QueueIncomingRequest(
                     new BridgeRequest
                     {
                         Command = "inn-end-expedition-state"
@@ -2228,7 +2385,7 @@ namespace DD2Bridge
             if (action == "take_hope")
             {
                 Logger.LogInfo("COMMAND inn_end_expedition: take_hope");
-                _requests.Enqueue(
+                QueueIncomingRequest(
                     new BridgeRequest
                     {
                         Command = "inn-end-expedition-take-hope"
@@ -2239,7 +2396,7 @@ namespace DD2Bridge
             if (action == "back")
             {
                 Logger.LogInfo("COMMAND inn_end_expedition: back");
-                _requests.Enqueue(
+                QueueIncomingRequest(
                     new BridgeRequest
                     {
                         Command = "inn-end-expedition-back"
@@ -2250,7 +2407,7 @@ namespace DD2Bridge
             if (action == "store")
             {
                 Logger.LogInfo("COMMAND inn: store");
-                _requests.Enqueue(
+                QueueIncomingRequest(
                     new BridgeRequest
                     {
                         Command = "inn-store-state"
@@ -2261,7 +2418,7 @@ namespace DD2Bridge
             if (action == "inn_store_state")
             {
                 Logger.LogInfo("COMMAND inn_store: state");
-                _requests.Enqueue(
+                QueueIncomingRequest(
                     new BridgeRequest
                     {
                         Command = "inn-store-state"
@@ -2289,7 +2446,7 @@ namespace DD2Bridge
                 }
 
                 Logger.LogInfo($"COMMAND inn_store: buy slot={slot}");
-                _requests.Enqueue(
+                QueueIncomingRequest(
                     new BridgeRequest
                     {
                         Command = "inn-store-buy " + slot
@@ -2317,7 +2474,7 @@ namespace DD2Bridge
                 }
 
                 Logger.LogInfo($"COMMAND inn_store: discard slot={slot}");
-                _requests.Enqueue(
+                QueueIncomingRequest(
                     new BridgeRequest
                     {
                         Command = "inn-store-discard " + slot
@@ -2328,7 +2485,7 @@ namespace DD2Bridge
             if (action == "inn_store_back")
             {
                 Logger.LogInfo("COMMAND inn_store: back");
-                _requests.Enqueue(
+                QueueIncomingRequest(
                     new BridgeRequest
                     {
                         Command = "inn-store-back"
@@ -2339,7 +2496,7 @@ namespace DD2Bridge
             if (action == "mastery")
             {
                 Logger.LogInfo("COMMAND inn: mastery");
-                _requests.Enqueue(
+                QueueIncomingRequest(
                     new BridgeRequest
                     {
                         Command = "inn-mastery-state"
@@ -2350,7 +2507,7 @@ namespace DD2Bridge
             if (action == "wainwright" || action == "inn_wainwright_state")
             {
                 Logger.LogInfo("COMMAND inn: wainwright");
-                _requests.Enqueue(
+                QueueIncomingRequest(
                     new BridgeRequest
                     {
                         Command = "inn-wainwright-state"
@@ -2388,7 +2545,7 @@ namespace DD2Bridge
                     return;
                 }
 
-                _requests.Enqueue(
+                QueueIncomingRequest(
                     new BridgeRequest
                     {
                         Command =
@@ -2423,7 +2580,7 @@ namespace DD2Bridge
                     return;
                 }
 
-                _requests.Enqueue(
+                QueueIncomingRequest(
                     new BridgeRequest
                     {
                         Command =
@@ -2435,7 +2592,7 @@ namespace DD2Bridge
 
             if (action == "inn_wainwright_back")
             {
-                _requests.Enqueue(
+                QueueIncomingRequest(
                     new BridgeRequest
                     {
                         Command = "inn-wainwright-back"
@@ -2446,7 +2603,7 @@ namespace DD2Bridge
             if (action == "inn_items" || action == "inn_items_state")
             {
                 Logger.LogInfo("COMMAND inn: inn_items");
-                _requests.Enqueue(new BridgeRequest { Command = "inn-items-state" });
+                QueueIncomingRequest(new BridgeRequest { Command = "inn-items-state" });
                 return;
             }
 
@@ -2463,20 +2620,20 @@ namespace DD2Bridge
                 JArray targetGuids = message["target_guids"] as JArray;
                 if (targetGuids != null)
                     foreach (JToken target in targetGuids) command += " " + target.ToString();
-                _requests.Enqueue(new BridgeRequest { Command = command });
+                QueueIncomingRequest(new BridgeRequest { Command = command });
                 return;
             }
 
             if (action == "inn_items_back")
             {
-                _requests.Enqueue(new BridgeRequest { Command = "inn-items-back" });
+                QueueIncomingRequest(new BridgeRequest { Command = "inn-items-back" });
                 return;
             }
 
             if (action == "route" || action == "inn_route_state")
             {
                 Logger.LogInfo("COMMAND inn: route");
-                _requests.Enqueue(
+                QueueIncomingRequest(
                     new BridgeRequest
                     {
                         Command = "inn-route-state"
@@ -2505,7 +2662,7 @@ namespace DD2Bridge
 
                 Logger.LogInfo(
                     $"COMMAND inn_route_choice: choose_route option={optionIndex}");
-                _requests.Enqueue(
+                QueueIncomingRequest(
                     new BridgeRequest
                     {
                         Command = "inn-route-choose " + optionIndex
@@ -2515,7 +2672,7 @@ namespace DD2Bridge
 
             if (action == "inn_route_back")
             {
-                _requests.Enqueue(
+                QueueIncomingRequest(
                     new BridgeRequest
                     {
                         Command = "inn-route-back"
@@ -2526,7 +2683,7 @@ namespace DD2Bridge
             if (action == "inn_mastery_state")
             {
                 Logger.LogInfo("COMMAND inn_mastery: state");
-                _requests.Enqueue(
+                QueueIncomingRequest(
                     new BridgeRequest
                     {
                         Command = "inn-mastery-state"
@@ -2560,7 +2717,7 @@ namespace DD2Bridge
                 Logger.LogInfo(
                     $"COMMAND inn_mastery: upgrade_skill actor={actorGuid} " +
                     $"skill='{masterySkillId}'");
-                _requests.Enqueue(
+                QueueIncomingRequest(
                     new BridgeRequest
                     {
                         Command =
@@ -2573,7 +2730,7 @@ namespace DD2Bridge
             if (action == "inn_mastery_back")
             {
                 Logger.LogInfo("COMMAND inn_mastery: back");
-                _requests.Enqueue(
+                QueueIncomingRequest(
                     new BridgeRequest
                     {
                         Command = "inn-mastery-back"
@@ -2585,7 +2742,7 @@ namespace DD2Bridge
             {
                 Logger.LogInfo(
                     "COMMAND inn_travelogue: continue_travelogue");
-                _requests.Enqueue(
+                QueueIncomingRequest(
                     new BridgeRequest
                     {
                         Command = "semantic-continue"
@@ -2596,7 +2753,7 @@ namespace DD2Bridge
             if (action == "continue")
             {
                 Logger.LogInfo("COMMAND semantic: continue");
-                _requests.Enqueue(
+                QueueIncomingRequest(
                     new BridgeRequest
                     {
                         Command = "semantic-continue"
@@ -2607,7 +2764,7 @@ namespace DD2Bridge
             if (action == "new_expedition")
             {
                 Logger.LogInfo("COMMAND main_menu: new_expedition");
-                _requests.Enqueue(
+                QueueIncomingRequest(
                     new BridgeRequest
                     {
                         Command = "main-menu-new-expedition"
@@ -2618,7 +2775,7 @@ namespace DD2Bridge
             if (action == "continue_expedition")
             {
                 Logger.LogInfo("COMMAND main_menu: continue_expedition");
-                _requests.Enqueue(
+                QueueIncomingRequest(
                     new BridgeRequest
                     {
                         Command = "main-menu-continue-expedition"
@@ -2712,7 +2869,7 @@ namespace DD2Bridge
                         $"{targetGuid}"
                 };
 
-            _requests.Enqueue(request);
+            QueueIncomingRequest(request);
         }
     }
 }

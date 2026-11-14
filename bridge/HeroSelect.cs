@@ -49,6 +49,11 @@ namespace DD2Bridge
         // HeroSelect UI namespace. The native HeroSelectBhv remains the authority.
         private UnityEngine.MonoBehaviour _heroSelectReadyBhv;
         private bool _heroSelectReadySent;
+        // Discover the runtime-only UI type once, then query only that component
+        // instead of enumerating every MonoBehaviour in the loaded Unity project.
+        private Type _heroSelectRuntimeType;
+        private float _nextHeroSelectTypeDiscoveryAt;
+        private const float HeroSelectTypeDiscoveryInterval = 1.0f;
 
 
         private UnityEngine.MonoBehaviour GetStableHeroSelectBhv()
@@ -87,10 +92,46 @@ namespace DD2Bridge
             }
 
             UnityEngine.MonoBehaviour active = null;
-            UnityEngine.MonoBehaviour[] behaviours =
-                UnityEngine.Resources.FindObjectsOfTypeAll<UnityEngine.MonoBehaviour>();
 
-            foreach (UnityEngine.MonoBehaviour candidate in behaviours)
+            if (_heroSelectRuntimeType == null)
+            {
+                // This is the only broad scan, rate-limited while the UI has not
+                // appeared yet. Once found, the type stays valid across scenes.
+                if (UnityEngine.Time.unscaledTime < _nextHeroSelectTypeDiscoveryAt)
+                {
+                    return null;
+                }
+
+                _nextHeroSelectTypeDiscoveryAt =
+                    UnityEngine.Time.unscaledTime + HeroSelectTypeDiscoveryInterval;
+
+                UnityEngine.MonoBehaviour[] allBehaviours =
+                    UnityEngine.Resources.FindObjectsOfTypeAll<UnityEngine.MonoBehaviour>();
+
+                foreach (UnityEngine.MonoBehaviour candidate in allBehaviours)
+                {
+                    if (candidate != null &&
+                        string.Equals(candidate.GetType().Name,
+                            "HeroSelectBhv", StringComparison.Ordinal))
+                    {
+                        _heroSelectRuntimeType = candidate.GetType();
+                        break;
+                    }
+                }
+
+                if (_heroSelectRuntimeType == null)
+                {
+                    return null;
+                }
+            }
+
+            UnityEngine.Object[] behaviours =
+                UnityEngine.Resources.FindObjectsOfTypeAll(_heroSelectRuntimeType);
+
+            foreach (UnityEngine.Object unityObject in behaviours)
+            {
+                UnityEngine.MonoBehaviour candidate =
+                    unityObject as UnityEngine.MonoBehaviour;
             {
                 if (candidate == null ||
                     candidate.gameObject == null ||

@@ -70,34 +70,42 @@ namespace DD2Bridge
         private volatile bool _pipeClientConnected;
         private volatile bool _outgoingOverflowed;
 
-        private void QueueIncomingRequest(BridgeRequest request)
+        private readonly object _incomingQueueLock = new object();
+
+        private bool QueueIncomingRequest(BridgeRequest request)
         {
-            // Only the pipe reader produces commands, while the Unity Update
-            // thread consumes at most one per frame. A full queue rejects new
-            // commands explicitly rather than accumulating them in game memory.
-            if (_requests.Count >= MaxPendingCommands)
+            // Queue admission and dequeue must share a lock: Count followed by
+            // Enqueue without synchronization is not an atomic capacity check.
+            lock (_incomingQueueLock)
             {
-                QueueOutgoingMessage(new JObject
+                if (_requests.Count < MaxPendingCommands)
                 {
-                    ["type"] = "error",
-                    ["code"] = "command_queue_full",
-                    ["message"] = "Bridge command backlog is full; retry later"
-                });
-                return;
+                    _requests.Enqueue(request);
+                    return true;
+                }
             }
 
-            _requests.Enqueue(request);
+            QueueOutgoingMessage(new JObject
+            {
+                ["type"] = "error",
+                ["code"] = "command_queue_full",
+                ["message"] = "Bridge command backlog is full; retry later"
+            });
+            return false;
         }
 
         private void DiscardPendingRequests()
         {
-            BridgeRequest ignored;
             int count = 0;
-            while (_requests.TryDequeue(out ignored))
+            lock (_incomingQueueLock)
             {
-                ignored.Response = "ERROR: transport session ended";
-                ignored.Completed.Set();
-                count++;
+                BridgeRequest ignored;
+                while (_requests.TryDequeue(out ignored))
+                {
+                    ignored.Response = "ERROR: transport session ended";
+                    ignored.Completed.Set();
+                    count++;
+                }
             }
 
             if (count > 0)
@@ -207,9 +215,12 @@ namespace DD2Bridge
         {
             BridgeRequest request;
 
-            if (!_requests.TryDequeue(out request))
+            lock (_incomingQueueLock)
             {
-                return;
+                if (!_requests.TryDequeue(out request))
+                {
+                    return;
+                }
             }
 
             try
@@ -1369,6 +1380,66 @@ namespace DD2Bridge
 #if DEBUG
             // Non-production IPC stress probe. No game actions, saves or Unity
             // objects are touched. The 513th message must trigger overflow.
+            // An atomic, synthetic cap test: Unity cannot consume the dummy
+            // requests while the producer holds the shared queue lock. The
+            // whole test is drained before returning, so no dummy game
+            // command can execute or affect the save.
+            if (action == "debug_stress_incoming_queue")
+            {
+                int accepted = 0;
+                bool overflowRejected;
+                int peak;
+
+                lock (_incomingQueueLock)
+                {
+                    // The test is only meaningful with an empty backlog.
+                    if (_requests.Count != 0)
+                    {
+                        QueueOutgoingMessage(new JObject
+                        {
+                            ["type"] = "error",
+                            ["code"] = "debug_queue_not_empty",
+                            ["message"] = "Retry the probe while no commands are pending"
+                        });
+                        return;
+                    }
+
+                    for (int i = 0; i < MaxPendingCommands; i++)
+                    {
+                        if (QueueIncomingRequest(new BridgeRequest
+                        {
+                            Command = "debug-incoming-noop"
+                        }))
+                        {
+                            accepted++;
+                        }
+                    }
+
+                    overflowRejected = !QueueIncomingRequest(new BridgeRequest
+                    {
+                        Command = "debug-incoming-noop"
+                    });
+                    peak = _requests.Count;
+
+                    BridgeRequest ignored;
+                    while (_requests.TryDequeue(out ignored))
+                    {
+                        ignored.Completed.Set();
+                    }
+                }
+
+                QueueOutgoingMessage(new JObject
+                {
+                    ["type"] = "debug_incoming_queue_result",
+                    ["accepted"] = accepted,
+                    ["limit"] = MaxPendingCommands,
+                    ["peak"] = peak,
+                    ["overflow_rejected"] = overflowRejected,
+                    ["remaining"] = _requests.Count
+                });
+                return;
+            }
+
             if (action == "debug_stress_outgoing_queue")
             {
                 for (int i = 0; i <= MaxOutgoingMessages; i++)

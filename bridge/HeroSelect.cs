@@ -132,7 +132,6 @@ namespace DD2Bridge
             {
                 UnityEngine.MonoBehaviour candidate =
                     unityObject as UnityEngine.MonoBehaviour;
-            {
                 if (candidate == null ||
                     candidate.gameObject == null ||
                     !candidate.gameObject.activeInHierarchy ||

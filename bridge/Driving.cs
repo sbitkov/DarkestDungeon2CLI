@@ -72,6 +72,39 @@ namespace DD2Bridge
             }
         }
 
+        // During normal free travel, modal frontend discovery is unnecessary.
+        // Its Resources.FindObjectsOfTypeAll probes can cause periodic hitches
+        // on the Unity main thread. Keep the full checks whenever driving is
+        // stopped or input is blocked, so road interactions remain discoverable.
+        private bool IsUnblockedStagecoachInMotion()
+        {
+            if (GameModeMgr.CurrentMode != GameModeType.DRIVING)
+            {
+                return false;
+            }
+
+            MapMgrBhv map = SingletonMonoBehaviour<MapMgrBhv>.Instance;
+            CommonUiBhv ui = SingletonMonoBehaviour<CommonUiBhv>.Instance;
+            StageCoachVehicleControlBhv vehicle = _stagecoachVehicleCache;
+
+            if (map == null || !map.IsInDrivingState() ||
+                ui == null || ui.IsEnterNodeScreenActive ||
+                ui.IsDrivingInputBlockerActive ||
+                vehicle == null || vehicle.gameObject == null ||
+                !vehicle.gameObject.activeInHierarchy ||
+                !vehicle.enabled || !vehicle.IsPlayable() ||
+                !vehicle.IsPlayerInputEnabled)
+            {
+                return false;
+            }
+
+            StageCoachInternalState state =
+                vehicle.GetInternalState() as StageCoachInternalState;
+
+            return state != null &&
+                UnityEngine.Mathf.Abs(state.GetSpeed()) >= 0.01f;
+        }
+
         private StageCoachVehicleControlBhv GetStableStagecoachReadyVehicle()
         {
             if (GameModeMgr.CurrentMode != GameModeType.DRIVING)

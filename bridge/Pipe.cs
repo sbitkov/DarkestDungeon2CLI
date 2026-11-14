@@ -89,6 +89,24 @@ namespace DD2Bridge
             _requests.Enqueue(request);
         }
 
+        private void DiscardPendingRequests()
+        {
+            BridgeRequest ignored;
+            int count = 0;
+            while (_requests.TryDequeue(out ignored))
+            {
+                ignored.Response = "ERROR: transport session ended";
+                ignored.Completed.Set();
+                count++;
+            }
+
+            if (count > 0)
+            {
+                Logger.LogWarning(
+                    $"PIPE: discarded {count} commands from disconnected session");
+            }
+        }
+
         private void QueueOutgoingMessage(JObject message)
         {
             // Disconnected-session events were already discarded on reconnect.
@@ -1003,6 +1021,7 @@ namespace DD2Bridge
                 finally
                 {
                     _pipeClientConnected = false;
+                    DiscardPendingRequests();
                     DiscardOutgoing();
                     _outgoingOverflowed = false;
 
@@ -1294,6 +1313,20 @@ namespace DD2Bridge
         
         private void HandleIncomingPipeMessage(string line)
         {
+            // Input size must not turn into arbitrarily large retained commands.
+            // A line is already read at this point; the cap prevents parsing,
+            // queueing and further allocations from oversized input.
+            if (line == null || line.Length > 64 * 1024)
+            {
+                QueueOutgoingMessage(new JObject
+                {
+                    ["type"] = "error",
+                    ["code"] = "command_too_large",
+                    ["message"] = "Command exceeds the 64 Ki-character limit"
+                });
+                return;
+            }
+
             //Logger.LogInfo($"PIPE RX: {line}");
             
             JObject message;

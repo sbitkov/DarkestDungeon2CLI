@@ -3749,7 +3749,9 @@ def run_session(pipe):
         "activity": None,
     }
 
-    inbox = queue.Queue()
+    # Backpressure the pipe reader if console rendering falls behind.
+    # Blocking puts preserve ordering and do not drop combat events silently.
+    inbox = queue.Queue(maxsize=512)
     activity = ActivityIndicator()
 
     pipe_reader = threading.Thread(
@@ -3825,6 +3827,13 @@ def run_session(pipe):
 
         message = payload
         message_type = message.get("type")
+
+        if message_type == "error" and message.get("code") == "fatal_transport_overflow":
+            activity.stop()
+            print()
+            print("FATAL DD2Bridge transport overflow:", message.get("message"))
+            print("The event history may be incomplete. Closing this session.")
+            return
 
         if message_type == "bridge_info":
             version = str(message.get("version") or "<unknown>")

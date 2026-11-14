@@ -9,6 +9,7 @@ using System.Collections;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Security.AccessControl;
 using System.Security.Principal;
 
@@ -528,6 +529,110 @@ namespace DD2Bridge
             }
         }
 
+        // Mono bundled with DD2 does not implement WindowsIdentity.User.
+        // Query the current process token directly using Win32, then convert
+        // its SID to a string accepted by SecurityIdentifier under Mono.
+        private const uint TokenQuery = 0x0008;
+        private const int TokenUserInformationClass = 1;
+
+        [DllImport("kernel32.dll")]
+        private static extern IntPtr GetCurrentProcess();
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool OpenProcessToken(
+            IntPtr processHandle, uint desiredAccess, out IntPtr tokenHandle);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GetTokenInformation(
+            IntPtr tokenHandle, int tokenInformationClass,
+            IntPtr tokenInformation, int tokenInformationLength,
+            out int returnLength);
+
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool ConvertSidToStringSid(
+            IntPtr sid, out IntPtr stringSid);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr LocalFree(IntPtr memory);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool CloseHandle(IntPtr handle);
+
+        private static SecurityIdentifier GetCurrentProcessUserSid()
+        {
+            IntPtr token = IntPtr.Zero;
+            IntPtr tokenInformation = IntPtr.Zero;
+            IntPtr sidString = IntPtr.Zero;
+
+            try
+            {
+                if (!OpenProcessToken(GetCurrentProcess(), TokenQuery, out token))
+                {
+                    throw new System.ComponentModel.Win32Exception(
+                        Marshal.GetLastWin32Error(), "OpenProcessToken failed");
+                }
+
+                int length;
+                // Initial call obtains the required buffer size.
+                GetTokenInformation(token, TokenUserInformationClass,
+                    IntPtr.Zero, 0, out length);
+
+                if (length <= 0)
+                {
+                    throw new System.ComponentModel.Win32Exception(
+                        Marshal.GetLastWin32Error(), "TokenUser size lookup failed");
+                }
+
+                tokenInformation = Marshal.AllocHGlobal(length);
+                if (!GetTokenInformation(token, TokenUserInformationClass,
+                    tokenInformation, length, out length))
+                {
+                    throw new System.ComponentModel.Win32Exception(
+                        Marshal.GetLastWin32Error(), "GetTokenInformation failed");
+                }
+
+                // TOKEN_USER begins with SID_AND_ATTRIBUTES, whose first
+                // field is PSID (a pointer, not an inline SID structure).
+                IntPtr sid = Marshal.ReadIntPtr(tokenInformation);
+                if (sid == IntPtr.Zero ||
+                    !ConvertSidToStringSid(sid, out sidString))
+                {
+                    throw new System.ComponentModel.Win32Exception(
+                        Marshal.GetLastWin32Error(), "ConvertSidToStringSid failed");
+                }
+
+                string sidValue = Marshal.PtrToStringUni(sidString);
+                if (string.IsNullOrEmpty(sidValue))
+                {
+                    throw new InvalidOperationException(
+                        "Process token contains an empty user SID");
+                }
+
+                return new SecurityIdentifier(sidValue);
+            }
+            finally
+            {
+                if (sidString != IntPtr.Zero)
+                {
+                    LocalFree(sidString);
+                }
+
+                if (tokenInformation != IntPtr.Zero)
+                {
+                    Marshal.FreeHGlobal(tokenInformation);
+                }
+
+                if (token != IntPtr.Zero)
+                {
+                    CloseHandle(token);
+                }
+            }
+        }
+
         private void PipeServerLoop()
         {
             while (_pipeRunning)
@@ -538,7 +643,7 @@ namespace DD2Bridge
                     // An optional second account (e.g. a sandboxed host) must
                     // be deliberately enabled by setting DD2_BRIDGE_ADDITIONAL_SID.
                     SecurityIdentifier currentUserSid =
-                        WindowsIdentity.GetCurrent().User;
+                        GetCurrentProcessUserSid();
 
                     if (currentUserSid == null)
                     {

@@ -9,6 +9,7 @@ using System.Collections;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Security.AccessControl;
 using System.Security.Principal;
 
@@ -528,50 +529,159 @@ namespace DD2Bridge
             }
         }
 
+        // Mono bundled with DD2 does not implement WindowsIdentity.User.
+        // Query the current process token directly using Win32, then convert
+        // its SID to a string accepted by SecurityIdentifier under Mono.
+        private const uint TokenQuery = 0x0008;
+        private const int TokenUserInformationClass = 1;
+
+        [DllImport("kernel32.dll")]
+        private static extern IntPtr GetCurrentProcess();
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool OpenProcessToken(
+            IntPtr processHandle, uint desiredAccess, out IntPtr tokenHandle);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GetTokenInformation(
+            IntPtr tokenHandle, int tokenInformationClass,
+            IntPtr tokenInformation, int tokenInformationLength,
+            out int returnLength);
+
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool ConvertSidToStringSid(
+            IntPtr sid, out IntPtr stringSid);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr LocalFree(IntPtr memory);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool CloseHandle(IntPtr handle);
+
+        private static SecurityIdentifier GetCurrentProcessUserSid()
+        {
+            IntPtr token = IntPtr.Zero;
+            IntPtr tokenInformation = IntPtr.Zero;
+            IntPtr sidString = IntPtr.Zero;
+
+            try
+            {
+                if (!OpenProcessToken(GetCurrentProcess(), TokenQuery, out token))
+                {
+                    throw new System.ComponentModel.Win32Exception(
+                        Marshal.GetLastWin32Error(), "OpenProcessToken failed");
+                }
+
+                int length;
+                // Initial call obtains the required buffer size.
+                GetTokenInformation(token, TokenUserInformationClass,
+                    IntPtr.Zero, 0, out length);
+
+                if (length <= 0)
+                {
+                    throw new System.ComponentModel.Win32Exception(
+                        Marshal.GetLastWin32Error(), "TokenUser size lookup failed");
+                }
+
+                tokenInformation = Marshal.AllocHGlobal(length);
+                if (!GetTokenInformation(token, TokenUserInformationClass,
+                    tokenInformation, length, out length))
+                {
+                    throw new System.ComponentModel.Win32Exception(
+                        Marshal.GetLastWin32Error(), "GetTokenInformation failed");
+                }
+
+                // TOKEN_USER begins with SID_AND_ATTRIBUTES, whose first
+                // field is PSID (a pointer, not an inline SID structure).
+                IntPtr sid = Marshal.ReadIntPtr(tokenInformation);
+                if (sid == IntPtr.Zero ||
+                    !ConvertSidToStringSid(sid, out sidString))
+                {
+                    throw new System.ComponentModel.Win32Exception(
+                        Marshal.GetLastWin32Error(), "ConvertSidToStringSid failed");
+                }
+
+                string sidValue = Marshal.PtrToStringUni(sidString);
+                if (string.IsNullOrEmpty(sidValue))
+                {
+                    throw new InvalidOperationException(
+                        "Process token contains an empty user SID");
+                }
+
+                return new SecurityIdentifier(sidValue);
+            }
+            finally
+            {
+                if (sidString != IntPtr.Zero)
+                {
+                    LocalFree(sidString);
+                }
+
+                if (tokenInformation != IntPtr.Zero)
+                {
+                    Marshal.FreeHGlobal(tokenInformation);
+                }
+
+                if (token != IntPtr.Zero)
+                {
+                    CloseHandle(token);
+                }
+            }
+        }
+
         private void PipeServerLoop()
         {
             while (_pipeRunning)
             {
                 try
                 {
-                    // CodexPipeAclV3
-                    // v2 proved that Mono accepts the PipeSecurity overload but
-                    // silently leaves the Windows pipe with the default DACL.
-                    // v3 therefore asks the SERVER HANDLE for WRITE_DAC
-                    // (ChangePermissions), then edits the DACL on that actual
-                    // handle and verifies the resulting descriptor before
-                    // WaitForConnection().
-                    const string RemiliaSid =
-                        "S-1-5-21-926465663-700626426-2787390607-1001";
-                    const string CodexSandboxSid =
-                        "S-1-5-21-926465663-700626426-2787390607-1003";
+                    // Resolve access for the actual Windows account running DD2.
+                    // An optional second account (e.g. a sandboxed host) must
+                    // be deliberately enabled by setting DD2_BRIDGE_ADDITIONAL_SID.
+                    SecurityIdentifier currentUserSid =
+                        GetCurrentProcessUserSid();
 
-                    Logger.LogInfo(
-                        "PIPE ACL v3: preparing requested security descriptor");
+                    if (currentUserSid == null)
+                    {
+                        throw new InvalidOperationException(
+                            "Cannot resolve the current Windows user SID");
+                    }
+
+                    string additionalSidText =
+                        Environment.GetEnvironmentVariable(
+                            "DD2_BRIDGE_ADDITIONAL_SID");
+
+                    SecurityIdentifier additionalSid = null;
+                    if (!string.IsNullOrWhiteSpace(additionalSidText))
+                    {
+                        additionalSid = new SecurityIdentifier(
+                            additionalSidText.Trim());
+                    }
 
                     PipeSecurity requestedSecurity = new PipeSecurity();
-
-                    SecurityIdentifier remiliaUser =
-                        new SecurityIdentifier(RemiliaSid);
-
-                    SecurityIdentifier codexSandboxUser =
-                        new SecurityIdentifier(CodexSandboxSid);
-
                     requestedSecurity.AddAccessRule(
                         new PipeAccessRule(
-                            remiliaUser,
+                            currentUserSid,
                             PipeAccessRights.FullControl,
                             AccessControlType.Allow));
 
-                    requestedSecurity.AddAccessRule(
-                        new PipeAccessRule(
-                            codexSandboxUser,
-                            PipeAccessRights.ReadWrite,
-                            AccessControlType.Allow));
+                    if (additionalSid != null &&
+                        additionalSid != currentUserSid)
+                    {
+                        requestedSecurity.AddAccessRule(
+                            new PipeAccessRule(
+                                additionalSid,
+                                PipeAccessRights.ReadWrite,
+                                AccessControlType.Allow));
+                    }
 
-                    Logger.LogInfo(
-                        "PIPE ACL v3: creating server handle with ChangePermissions");
-
+                    // Mono may ignore the constructor-supplied DACL. Explicitly
+                    // apply and verify rights on the server handle before accepting
+                    // a client, preserving system/default ACEs.
                     _activePipe = new NamedPipeServerStream(
                         "dd2-agent",
                         PipeDirection.InOut,
@@ -584,49 +694,29 @@ namespace DD2Bridge
                         HandleInheritability.None,
                         PipeAccessRights.ChangePermissions);
 
-                    Logger.LogInfo(
-                        "PIPE ACL v3: server created; reading actual DACL");
-
-                    // Preserve whatever Windows/Mono actually put on the pipe
-                    // (SYSTEM, Administrators, etc.) and add only the two rules
-                    // we need. This avoids replacing the default ACL wholesale.
                     PipeSecurity effectiveSecurity =
                         _activePipe.GetAccessControl();
 
-                    Logger.LogInfo(
-                        "PIPE ACL v3: adding explicit Remilia/Codex rules to actual DACL");
-
                     effectiveSecurity.AddAccessRule(
                         new PipeAccessRule(
-                            remiliaUser,
+                            currentUserSid,
                             PipeAccessRights.FullControl,
                             AccessControlType.Allow));
 
-                    effectiveSecurity.AddAccessRule(
-                        new PipeAccessRule(
-                            codexSandboxUser,
-                            PipeAccessRights.ReadWrite,
-                            AccessControlType.Allow));
-
-                    Logger.LogInfo(
-                        "PIPE ACL v3: applying actual DACL via server handle");
+                    if (additionalSid != null &&
+                        additionalSid != currentUserSid)
+                    {
+                        effectiveSecurity.AddAccessRule(
+                            new PipeAccessRule(
+                                additionalSid,
+                                PipeAccessRights.ReadWrite,
+                                AccessControlType.Allow));
+                    }
 
                     _activePipe.SetAccessControl(effectiveSecurity);
 
-                    Logger.LogInfo(
-                        "PIPE ACL v3: DACL applied; verifying");
-
                     PipeSecurity verifiedSecurity =
                         _activePipe.GetAccessControl();
-
-                    string verifiedSddl =
-                        verifiedSecurity.GetSecurityDescriptorSddlForm(
-                            AccessControlSections.Access);
-
-                    Logger.LogInfo(
-                        $"PIPE ACL v3: effective DACL={verifiedSddl}");
-
-                    bool codexReadWritePresent = false;
 
                     AuthorizationRuleCollection verifiedRules =
                         verifiedSecurity.GetAccessRules(
@@ -634,10 +724,12 @@ namespace DD2Bridge
                             true,
                             typeof(SecurityIdentifier));
 
+                    bool currentUserAllowed = false;
+                    bool additionalUserAllowed = additionalSid == null;
+
                     foreach (AuthorizationRule rule in verifiedRules)
                     {
-                        PipeAccessRule pipeRule =
-                            rule as PipeAccessRule;
+                        PipeAccessRule pipeRule = rule as PipeAccessRule;
 
                         if (pipeRule == null ||
                             pipeRule.AccessControlType !=
@@ -647,30 +739,38 @@ namespace DD2Bridge
                         }
 
                         SecurityIdentifier ruleSid =
-                            pipeRule.IdentityReference
-                                as SecurityIdentifier;
+                            pipeRule.IdentityReference as SecurityIdentifier;
 
-                        if (ruleSid != null &&
-                            ruleSid.Value == CodexSandboxSid &&
-                            (pipeRule.PipeAccessRights &
-                                PipeAccessRights.ReadWrite) ==
+                        if (ruleSid == null)
+                        {
+                            continue;
+                        }
+
+                        if (ruleSid.Value == currentUserSid.Value &&
+                            (pipeRule.PipeAccessRights & PipeAccessRights.ReadWrite) ==
                                 PipeAccessRights.ReadWrite)
                         {
-                            codexReadWritePresent = true;
-                            break;
+                            currentUserAllowed = true;
+                        }
+
+                        if (additionalSid != null &&
+                            ruleSid.Value == additionalSid.Value &&
+                            (pipeRule.PipeAccessRights & PipeAccessRights.ReadWrite) ==
+                                PipeAccessRights.ReadWrite)
+                        {
+                            additionalUserAllowed = true;
                         }
                     }
 
-                    if (!codexReadWritePresent)
+                    if (!currentUserAllowed || !additionalUserAllowed)
                     {
                         throw new InvalidOperationException(
-                            "PIPE ACL v3 verification failed: " +
-                            "Codex sandbox ReadWrite ACE is absent");
+                            "Named pipe ACL verification failed for an allowed user");
                     }
 
                     Logger.LogInfo(
-                        "PIPE ACL v3: Codex sandbox ReadWrite ACE verified");
-
+                        "PIPE: access verified for current Windows user" +
+                        (additionalSid != null ? " and configured additional SID" : ""));
 
                     Logger.LogInfo("PIPE: waiting for agent host");
 

@@ -323,6 +323,15 @@ namespace DD2Bridge
 
             if (mode == GameModeType.DRIVING)
             {
+                // The stagecoach is already being driven with native game
+                // controls. Until it stops or the game blocks input, there is
+                // no CLI decision to discover. Avoid searching all loaded
+                // Unity objects every 100 ms while the road is scrolling.
+                if (IsUnblockedStagecoachInMotion())
+                {
+                    return;
+                }
+
                 // Max-Loathing boss empowerment is a modal DRIVING boundary.
                 // Give it priority over every underlying road/node frontend.
                 if (ProcessDoomResetReady())

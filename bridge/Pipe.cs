@@ -1366,6 +1366,25 @@ namespace DD2Bridge
 
             string action = (string)message["action"];
 
+#if DEBUG
+            // Non-production IPC stress probe. No game actions, saves or Unity
+            // objects are touched. The 513th message must trigger overflow.
+            if (action == "debug_stress_outgoing_queue")
+            {
+                for (int i = 0; i <= MaxOutgoingMessages; i++)
+                {
+                    QueueOutgoingMessage(new JObject
+                    {
+                        ["type"] = "status",
+                        ["activity"] = "debug_queue_probe",
+                        ["sequence"] = i
+                    });
+                }
+
+                return;
+            }
+#endif
+
             if (action == "map")
             {
                 Logger.LogInfo("COMMAND driving: map");

@@ -348,7 +348,8 @@ namespace DD2Bridge
             PlayerInventoryItemBhv itemBhv = inventoryUi == null
                 ? null : FindPlayerInventoryItemBhvForSlot(
                     inventoryUi.ItemContainerBhv, slot);
-            List<RestItemSlotBhv> restSlots = GetRestSlots(rest);
+            List<RestItemSlotBhv> restSlots = rest == null
+                ? null : GetRestSlots(rest);
             if (rest == null || itemBhv == null || restSlots == null)
             {
                 request.Response = "ERROR: native inn-item UI is unavailable";

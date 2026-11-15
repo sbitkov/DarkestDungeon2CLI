@@ -37,23 +37,26 @@ namespace DD2Bridge
             {
                 IReadOnlyList<uint> offered =
                     Singleton<InnBhv>.Instance.GetHireActorGuids();
-                foreach (uint guid in offered)
+                // The native hunter hire screen exposes and hires only
+                // the FIRST rolled candidate. Later internal GUIDs are hidden.
+                if (offered.Count > 0)
                 {
+                    uint guid = offered[0];
                     ActorInstance actor = GetHeroActorInstance(guid);
-                    if (actor == null)
-                        continue;
-
-                    candidates.Add(new JObject
+                    if (actor != null)
                     {
-                        ["actor_guid"] = guid,
-                        ["actor_name"] = actor.ActorName ?? "",
-                        ["actor_data_id"] = actor.ActorDataId ?? ""
-                    });
-                    actions.Add(new JObject
-                    {
-                        ["action"] = "inn_hire_select",
-                        ["actor_guid"] = guid
-                    });
+                        candidates.Add(new JObject
+                        {
+                            ["actor_guid"] = guid,
+                            ["actor_name"] = actor.ActorName ?? "",
+                            ["actor_data_id"] = actor.ActorDataId ?? ""
+                        });
+                        actions.Add(new JObject
+                        {
+                            ["action"] = "inn_hire_select",
+                            ["actor_guid"] = guid
+                        });
+                    }
                 }
 
                 IReadOnlyList<uint> partyGuids =
@@ -149,9 +152,7 @@ namespace DD2Bridge
 
             var roster = Singleton<GameTypeMgr>.Instance.RosterManager;
             IReadOnlyList<uint> offered = Singleton<InnBhv>.Instance.GetHireActorGuids();
-            bool isOffered = false;
-            foreach (uint candidate in offered)
-                if (candidate == hireGuid) isOffered = true;
+            bool isOffered = offered.Count > 0 && offered[0] == hireGuid;
             if (!isOffered)
             {
                 request.Response = "ERROR: candidate is no longer offered at this inn";

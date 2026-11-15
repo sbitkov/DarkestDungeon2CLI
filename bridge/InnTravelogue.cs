@@ -867,6 +867,18 @@ namespace DD2Bridge
                 return false;
             }
 
+            // The arrival travelogue is a foreground decision boundary.
+            // An inn READY may already have been sent during the transition
+            // into INN before this modal became stable. Invalidate it while
+            // travelogue owns the foreground so the ordinary inn READY is
+            // announced after HandleContinueButton closes the results.
+            if (_innReadySent)
+            {
+                _innReadySent = false;
+                Logger.LogInfo(
+                    "READY inn invalidated: inn_travelogue owns foreground");
+            }
+
             if (_innTravelogueReadySent)
             {
                 return true;

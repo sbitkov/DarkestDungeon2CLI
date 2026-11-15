@@ -4722,6 +4722,12 @@ def run_session(pipe):
             consequences = message.get("consequences") or []
             if not consequences:
                 print("  no observable state changes")
+            inn_snapshot = session_state.get("frontend_snapshot") or {}
+            actor_names = {
+                a.get("actor_guid"): (a.get("actor_name") or "")
+                for a in (inn_snapshot.get("party") or [])
+                if isinstance(a, dict)
+            }
             for c in consequences:
                 if not isinstance(c, dict):
                     print(f"  {c}")
@@ -4729,7 +4735,20 @@ def run_session(pipe):
                 ctype = c.get("type") or "change"
                 actor = c.get("actor_guid")
                 line = f"  {ctype}" + (f" actor=[{actor}]" if actor is not None else "")
-                if "delta" in c:
+                if ctype == "relationship_changed":
+                    participants = [
+                        f"{actor_names.get(guid) or 'Hero'} [{guid}]"
+                        for guid in (c.get("actor_guids") or [])
+                    ]
+                    if participants:
+                        line += " " + " + ".join(participants)
+                    line += (
+                        f" delta={c.get('delta')}"
+                        f" ({c.get('previous')} -> {c.get('current')})"
+                    )
+                    if c.get("source_type"):
+                        line += f" source={c['source_type']}"
+                elif "delta" in c:
                     line += f" delta={c.get('delta')} ({c.get('before')} -> {c.get('after')})"
                 elif ctype.startswith("quirk_"):
                     line += f" {c.get('name') or c.get('quirk_id') or ''}"

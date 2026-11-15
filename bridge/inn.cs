@@ -47,8 +47,7 @@ namespace DD2Bridge
                         {
                             ["action"] = "hire",
                             ["available"] =
-                                Singleton<InnBhv>.Instance != null &&
-                                Singleton<InnBhv>.Instance.GetHireActorGuids() != null &&
+                                CanUseInnHire() &&
                                 Singleton<InnBhv>.Instance.GetHireActorGuids().Count > 0
                         },
                         new JObject

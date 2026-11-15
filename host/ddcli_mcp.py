@@ -8,9 +8,7 @@ from collections import deque
 from contextlib import suppress
 from threading import Lock, Thread
 import json
-import os
 import queue
-import sys
 import time
 
 from mcp.server import MCPServer
@@ -60,6 +58,15 @@ class GameSession:
             ) from exc
         self.reader = Thread(target=self._reader, name="ddcli-mcp-pipe", daemon=True)
         self.reader.start()
+        # The bridge initially reports its authoritative READY boundary.
+        # Do not dispatch game commands before the initial snapshot arrives.
+        deadline = time.monotonic() + self.timeout
+        while True:
+            message = self._next(deadline)
+            if message.get("type") in ("ready", "state"):
+                break
+            if message.get("type") == "status" and message.get("activity") == "driving":
+                break
 
     def _record(self, message):
         kind = message.get("type")
@@ -69,7 +76,7 @@ class GameSession:
             self.activity = message.get("activity")
         if kind == "ready":
             self.activity = None
-        if kind == "ready" or kind == "state" or kind.endswith("_state"):
+        if isinstance(kind, str) and (kind in ("ready", "state") or kind.endswith("_state")):
             # Preserve *exactly* the bridge's player-facing data, not an
             # invented or expanded interpretation of game internals.
             self.snapshot = message
@@ -120,7 +127,7 @@ class GameSession:
         except OSError as exc:
             raise BridgeDisconnected(f"DDCLI send failed: {exc}") from exc
 
-    def _exchange(self, action, arguments=None, terminal=None):
+    def _exchange(self, action, arguments=None):
         with self.lock:
             self._connect()
             self._drain()
@@ -145,8 +152,6 @@ class GameSession:
                 # Driving remains interruptible. The 'status' event gives
                 # control back rather than waiting for a distant READY.
                 if kind == "status" and message.get("activity") == "driving":
-                    break
-                if terminal is not None and kind in terminal:
                     break
             return {
                 "messages": messages,
@@ -211,8 +216,8 @@ def run_mcp(pipe_path):
         """Execute a native DD2Bridge action. Pass argument fields from available_actions."""
         if not action or not isinstance(action, str):
             raise ValueError("action must be a nonempty string")
-        if action == "quit":
-            raise ValueError("quit is a local CLI command, not a game action")
+        if action in ("quit", "raw_actions", "help"):
+            raise ValueError("This is a local CLI command, not a bridge action")
         return game._exchange(action, arguments)
 
     @mcp.tool()

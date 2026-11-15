@@ -1466,6 +1466,23 @@ def read_command(session_state=None):
             continue
 
         if frontend_state == "inn_hire":
+            inspect_match = re.fullmatch(r"inspect_hire\s+(\d+)", text)
+            if inspect_match:
+                guid = int(inspect_match.group(1))
+                offered = {
+                    c.get("actor_guid")
+                    for c in (snapshot.get("candidates") or [])
+                    if isinstance(c, dict)
+                }
+                if guid not in offered:
+                    print("That bounty hunter is not offered at this inn.")
+                    continue
+                return {
+                    "type": "command",
+                    "action": "inn_hire_inspect",
+                    "actor_guid": guid,
+                }
+
             if text in {"hire", "refresh"}:
                 session_state.pop("inn_hire_selected", None)
                 return {"type": "command", "action": "inn_hire_state"}
@@ -1479,6 +1496,7 @@ def read_command(session_state=None):
                     continue
                 session_state["inn_hire_selected"] = guid
                 print(f"Selected {candidate.get('actor_name') or candidate.get('actor_data_id')} [{guid}]")
+                print(f"  inspect_hire {guid}  - stats, skills, quirks and memories")
                 if snapshot.get("party_full"):
                     print("Choose whom to replace:")
                     for h in snapshot.get("party") or []:
@@ -2651,7 +2669,8 @@ def print_frontend_snapshot(message, heading):
         for h in message.get("party") or []:
             print(f"  [{h.get('actor_guid')}] {h.get('actor_name') or h.get('actor_data_id')}")
         print()
-        print("Commands: select_hire <actor_guid>, confirm_hire [replaced_actor_guid],")
+        print("Commands: inspect_hire <actor_guid>, select_hire <actor_guid>,")
+        print("          confirm_hire [replaced_actor_guid],")
         print("          cancel, hire, back, state, raw_actions, quit")
         print()
         return

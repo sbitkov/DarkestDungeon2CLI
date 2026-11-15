@@ -61,6 +61,33 @@ class BridgeSessionTests(unittest.TestCase):
         self.assertEqual(latest["latest_sequence"], 1)
         self.assertEqual(self.game.events_since(since=1)["messages"], [])
 
+    def test_rejected_refresh_is_not_falsely_fresh(self):
+        self.game.snapshot = {
+            "type": "ready", "frontend_state": "inn",
+            "available_actions": [{"action": "hire"}],
+        }
+        self.game.snapshot_sequence = 5
+
+        class RejectingPipe(FakePipe):
+            def write(self, data):
+                self.writes.append(json.loads(data.decode("utf-8")))
+                self.inbox.put(("message", {
+                    "type": "error", "code": "command_rejected",
+                    "message": "no stable decision boundary is available",
+                }))
+                return len(data)
+
+        self.game.pipe = RejectingPipe(self.game.inbox)
+        result = self.game._exchange("state")
+        self.assertFalse(result["refresh_succeeded"])
+        self.assertEqual(result["frontend_state_source"], "last_observed")
+        self.assertEqual(result["frontend_state"], "inn")
+        self.assertEqual(result["error"]["code"], "command_rejected")
+        cached = self.game.snapshot_status()
+        self.assertEqual(cached["snapshot_sequence"], 5)
+        self.assertFalse(cached["fresh_query"])
+        self.assertEqual(cached["snapshot"]["available_actions"][0]["action"], "hire")
+
     def test_disconnection_exposed(self):
         self.game.inbox.put(("disconnect", "broken pipe"))
         with self.assertRaises(RuntimeError):

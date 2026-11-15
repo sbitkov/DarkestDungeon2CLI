@@ -162,8 +162,8 @@ class GameSession:
 
     def status(self):
         with self.lock:
-            if self.pipe is not None:
-                self._drain()
+            self._connect()
+            self._drain()
             return {
                 "connected": self.pipe is not None and self.disconnected is None,
                 "pipe_path": self.pipe_path,

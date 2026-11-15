@@ -49,7 +49,7 @@ If the current Codex environment restricts access to the Windows Named Pipe, MCP
 
 ## Tools
 
-- `ddcli_status()` — process connection status, last observed frontend, bridge version and latest message cursor. Does not initiate a connection.
+- `ddcli_status()` — process connection status, last observed frontend, bridge version and latest message cursor. Connects on first use and reports errors if the pipe is inaccessible.
 - `ddcli_state()` — sends the bridge-native `state` command, returns the resulting player-visible messages, including current available actions.
 - `ddcli_command(action, arguments={})` — sends `{"type":"command","action":"..."}` with the provided action arguments directly to the existing bridge. Obtain action names and parameters from the current `available_actions`; this is **not** the human CLI's text alias parser.
 - `ddcli_events(since=0, limit=100)` — retrieve observed bridge messages in sequence order. Cursor paging and a `history_gap` flag expose bounded history.

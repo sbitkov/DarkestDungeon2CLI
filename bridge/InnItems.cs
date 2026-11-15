@@ -242,63 +242,193 @@ namespace DD2Bridge
 
         private void HandleInnItemUse(BridgeRequest request, string args)
         {
-            if (!IsStableInn()) { request.Response="ERROR: inn items are only available in the inn"; return; }
-            string[] parts=(args??"").Split(new[]{' '}, StringSplitOptions.RemoveEmptyEntries);
-            if (parts.Length < 1) { request.Response="ERROR: inn-item-use requires slot [actor_guid ...]"; return; }
-            int slot; if (!int.TryParse(parts[0],out slot)) { request.Response="ERROR: invalid inventory slot"; return; }
-            ItemInventory inv=GetPlayerInventory();
-            IReadOnlyItemInstance item=inv==null?null:inv.GetItem(slot);
-            if (!ItemUtils.IsValid(item) || !item.GetItemDefinition().IsUsedInInn()) { request.Response="ERROR: slot does not contain an inn item"; return; }
-
-            RestWidgetBhv rest=FindInnRestWidget();
-            InventoryUiBhv inventoryUi = GetStablePlayerInventoryUi();
-            PlayerInventoryItemBhv itemBhv = inventoryUi == null
-                ? null
-                : FindPlayerInventoryItemBhvForSlot(inventoryUi.ItemContainerBhv, slot);
-            List<RestItemSlotBhv> restSlots=GetRestSlots(rest);
-            if (rest==null || itemBhv==null || restSlots==null) { request.Response="ERROR: native inn-item UI is unavailable"; return; }
-
-            var before=CaptureInnItemParty();
-            _activeInnItemRelationshipConsequences = new JArray();
-            rest.SetItem(itemBhv);
-            int needed=item.GetItemDefinition().GetNumberOfSelectableRestItemTargets();
-            bool applied=false;
-            if (needed==4)
+            if (!IsStableInn())
             {
-                foreach (RestItemSlotBhv rs in restSlots) if (rs!=null && rs.IsActive) { applied=rs.OnItemInput(); break; }
-            }
-            else
-            {
-                for (int p=1;p<parts.Length;p++)
-                {
-                    uint guid; if (!uint.TryParse(parts[p],out guid)) continue;
-                    RestItemSlotBhv target=restSlots.Find(x=>x!=null && x.GetTargetActorGuid()==guid);
-                    if (target==null) { request.Response="ERROR: requested inn-item target is unavailable"; return; }
-                    applied=target.OnItemInput();
-                }
-            }
-            if (!applied)
-            {
-                _activeInnItemRelationshipConsequences = null;
-                request.Response="ERROR: native inn-item action was rejected";
+                request.Response = "ERROR: inn items are only available in the inn";
                 return;
             }
 
-            JArray consequences = BuildInnItemConsequences(before);
-            if (_activeInnItemRelationshipConsequences != null)
+            string[] parts = (args ?? "").Split(
+                new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+            int slot;
+            if (parts.Length == 0 || !int.TryParse(parts[0], out slot) || slot < 0)
             {
-                foreach (JToken relationship in _activeInnItemRelationshipConsequences)
-                    consequences.Add(relationship.DeepClone());
+                request.Response = "ERROR: invalid inventory slot";
+                return;
             }
-            _activeInnItemRelationshipConsequences = null;
 
-            JObject result=new JObject {
-                ["type"]="inn_item_result", ["slot"]=slot, ["item_id"]=item.GetItemDefinition().m_id??"",
-                ["consequences"]=consequences
-            };
-            QueueOutgoingMessage(result);
-            QueueOutgoingMessage(BuildInnItemsState());
-            request.Response="OK";
+            ItemInventory inventory = GetPlayerInventory();
+            if (inventory == null || slot >= inventory.GetNumberOfTotalSlots())
+            {
+                request.Response = "ERROR: inventory slot is unavailable";
+                return;
+            }
+
+            IReadOnlyItemInstance item = inventory.GetItem(slot);
+            ItemDefinition definition = ItemUtils.IsValid(item)
+                ? item.GetItemDefinition() : null;
+            if (definition == null || !definition.IsUsedInInn())
+            {
+                request.Response = "ERROR: slot does not contain an inn item";
+                return;
+            }
+
+            // Rebuild pre-use eligibility from live game state, not the
+            // possibly stale host preview. In particular, a grouped item
+            // must not be used if no eligible recipient exists.
+            IReadOnlyList<ActorInstance> actors =
+                Singleton<GameTypeMgr>.Instance.RosterManager.GetPartyActors();
+            JArray availableActions = new JArray();
+            BuildInnItemDescription(slot, item, definition, actors, availableActions);
+
+            List<uint> chosen = new List<uint>();
+            for (int i = 1; i < parts.Length; i++)
+            {
+                uint guid;
+                if (!uint.TryParse(parts[i], out guid) || chosen.Contains(guid))
+                {
+                    request.Response = "ERROR: invalid or duplicate inn item target";
+                    return;
+                }
+                chosen.Add(guid);
+            }
+            chosen.Sort();
+
+            bool permitted = false;
+            foreach (JToken token in availableActions)
+            {
+                JObject action = token as JObject;
+                JArray targetArray = action == null
+                    ? null : action["target_guids"] as JArray;
+                if (targetArray == null)
+                {
+                    continue;
+                }
+
+                List<uint> permittedTargets = new List<uint>();
+                foreach (JToken target in targetArray)
+                {
+                    uint guid;
+                    if (!uint.TryParse(target.ToString(), out guid))
+                    {
+                        continue;
+                    }
+                    permittedTargets.Add(guid);
+                }
+                permittedTargets.Sort();
+                if (permittedTargets.Count != chosen.Count)
+                {
+                    continue;
+                }
+                bool same = true;
+                for (int i = 0; i < chosen.Count; i++)
+                {
+                    if (chosen[i] != permittedTargets[i])
+                    {
+                        same = false;
+                        break;
+                    }
+                }
+                if (same)
+                {
+                    permitted = true;
+                    break;
+                }
+            }
+
+            if (!permitted)
+            {
+                request.Response = "ERROR: item/target combination is not eligible; refresh preview";
+                QueueOutgoingMessage(BuildInnItemsState());
+                return;
+            }
+
+            RestWidgetBhv rest = FindInnRestWidget();
+            InventoryUiBhv inventoryUi = GetStablePlayerInventoryUi();
+            PlayerInventoryItemBhv itemBhv = inventoryUi == null
+                ? null : FindPlayerInventoryItemBhvForSlot(
+                    inventoryUi.ItemContainerBhv, slot);
+            List<RestItemSlotBhv> restSlots = GetRestSlots(rest);
+            if (rest == null || itemBhv == null || restSlots == null)
+            {
+                request.Response = "ERROR: native inn-item UI is unavailable";
+                return;
+            }
+
+            // Resolve all targets before selecting anything in the native UI.
+            List<RestItemSlotBhv> selectedSlots = new List<RestItemSlotBhv>();
+            if (definition.GetNumberOfSelectableRestItemTargets() == 4)
+            {
+                foreach (RestItemSlotBhv restSlot in restSlots)
+                {
+                    if (restSlot != null && restSlot.IsActive)
+                    {
+                        selectedSlots.Add(restSlot);
+                        break;
+                    }
+                }
+            }
+            else
+            {
+                foreach (uint guid in chosen)
+                {
+                    RestItemSlotBhv target = restSlots.Find(
+                        x => x != null && x.GetTargetActorGuid() == guid);
+                    if (target == null)
+                    {
+                        request.Response = "ERROR: inn item target UI is unavailable";
+                        return;
+                    }
+                    selectedSlots.Add(target);
+                }
+            }
+
+            if (selectedSlots.Count == 0)
+            {
+                request.Response = "ERROR: no target UI available";
+                return;
+            }
+
+            string itemId = definition.m_id ?? "";
+            var before = CaptureInnItemParty();
+            _activeInnItemRelationshipConsequences = new JArray();
+            try
+            {
+                rest.SetItem(itemBhv);
+                bool applied = false;
+                foreach (RestItemSlotBhv target in selectedSlots)
+                {
+                    applied = target.OnItemInput();
+                }
+
+                if (!applied)
+                {
+                    request.Response = "ERROR: native inn-item action was rejected";
+                    return;
+                }
+
+                JArray consequences = BuildInnItemConsequences(before);
+                foreach (JToken relationship in _activeInnItemRelationshipConsequences)
+                {
+                    consequences.Add(relationship.DeepClone());
+                }
+
+                QueueOutgoingMessage(new JObject
+                {
+                    ["type"] = "inn_item_result",
+                    ["slot"] = slot,
+                    ["item_id"] = itemId,
+                    ["consequences"] = consequences
+                });
+                QueueOutgoingMessage(BuildInnItemsState());
+                request.Response = "OK";
+            }
+            finally
+            {
+                // Do not retain previous attempt's relationship observations
+                // if a native action fails or throws.
+                _activeInnItemRelationshipConsequences = null;
+            }
         }
 
         private void HandleInnItemsBack(BridgeRequest request)

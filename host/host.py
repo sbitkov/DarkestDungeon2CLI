@@ -5126,7 +5126,12 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if "--mcp" in sys.argv[1:]:
+        # MCP owns stdout: do not activate the interactive transcript or console.
+        from ddcli_mcp import run_mcp
+        run_mcp(PIPE_PATH)
+    else:
+        main()
 
 
 

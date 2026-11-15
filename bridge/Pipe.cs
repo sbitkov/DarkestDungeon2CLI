@@ -487,6 +487,11 @@ namespace DD2Bridge
             {
                 HandleInnHireState(request);
             }
+            else if (request.Command.StartsWith("inn-hire-inspect "))
+            {
+                HandleInnHireInspect(
+                    request, request.Command.Substring("inn-hire-inspect ".Length));
+            }
             else if (request.Command.StartsWith("inn-hire-confirm "))
             {
                 HandleInnHireConfirm(
@@ -2616,6 +2621,29 @@ namespace DD2Bridge
             if (action == "hire" || action == "inn_hire_state")
             {
                 QueueIncomingRequest(new BridgeRequest { Command = "inn-hire-state" });
+                return;
+            }
+
+            if (action == "inn_hire_inspect")
+            {
+                uint actorGuid;
+                JToken token = message["actor_guid"];
+                if (token == null ||
+                    !uint.TryParse(token.ToString(), out actorGuid) ||
+                    actorGuid == 0)
+                {
+                    QueueOutgoingMessage(new JObject
+                    {
+                        ["type"] = "error",
+                        ["code"] = "invalid_command",
+                        ["message"] = "inn_hire_inspect requires actor_guid"
+                    });
+                    return;
+                }
+                QueueIncomingRequest(new BridgeRequest
+                {
+                    Command = "inn-hire-inspect " + actorGuid
+                });
                 return;
             }
 

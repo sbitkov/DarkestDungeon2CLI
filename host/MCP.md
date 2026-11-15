@@ -12,7 +12,7 @@ The opt-in MCP transport is:
 python -u P:\Vault\DD2AgentHost\host.py --mcp
 ```
 
-It uses the **same bridge-native JSON commands** and the same `\\.\pipe\dd2-agent` connection. No C# changes, save-file access, hidden engine observations, network listener, or extra controller process.
+It uses the **same bridge-native JSON commands** and the same `\\.\pipe\dd2-agent` connection. No C# changes, save-file access, hidden engine observations, network listener, or extra controller process. **Note:** RC1 bridge currently rejects `state` in `inn` with `no stable decision boundary is available`. Use `ddcli_snapshot` for the last emitted READY and avoid treating it as a fresh query. The `implemented: false` field in that READY originates from `BuildInnReadyMessage` and does not imply the listed actions are unimplemented.
 
 ## Requirements
 
@@ -50,8 +50,9 @@ If the current Codex environment restricts access to the Windows Named Pipe, MCP
 ## Tools
 
 - `ddcli_status()` — process connection status, last observed frontend, bridge version and latest message cursor. Connects on first use and reports errors if the pipe is inaccessible.
-- `ddcli_state()` — sends the bridge-native `state` command, returns the resulting player-visible messages, including current available actions.
+- `ddcli_state()` — sends the bridge-native `state` command. When the bridge rejects a refresh (for example, the inn is not supported by `HandleCurrentState`), the result explicitly reports `refresh_succeeded: false`, the error, and `frontend_state_source: last_observed`.
 - `ddcli_command(action, arguments={})` — sends `{"type":"command","action":"..."}` with the provided action arguments directly to the existing bridge. Obtain action names and parameters from the current `available_actions`; this is **not** the human CLI's text alias parser.
+- `ddcli_snapshot()` — return the most recent bridge-emitted READY/state snapshot without sending a new command. **Cached, not a live refresh**; use when the bridge does not support `state` in the current frontend.
 - `ddcli_events(since=0, limit=100)` — retrieve observed bridge messages in sequence order. Cursor paging and a `history_gap` flag expose bounded history.
 
 Each tool call is serialized against the same pipe connection. The bridge continues to validate game actions; no tool bypasses player-visible DDCLI rules. An action waits for a response boundary (READY, state, error or driving status), with a bounded timeout. The client must refresh state following uncertain outcomes.

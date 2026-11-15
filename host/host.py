@@ -1393,6 +1393,14 @@ def read_command(session_state=None):
                 "action": "route",
             }
 
+        if frontend_state == "inn" and text in {"hire", "bounty_hunter"}:
+            offer = next((a for a in (snapshot.get("available_actions") or [])
+                          if isinstance(a, dict) and a.get("action") == "hire"), None)
+            if offer is None or not offer.get("available"):
+                print("No bounty hunter is offered at this inn.")
+                continue
+            return {"type": "command", "action": "inn_hire_state"}
+
         if frontend_state == "inn" and text in {"inn_items", "items", "rest_items"}:
             return {"type": "command", "action": "inn_items"}
 
@@ -1456,6 +1464,68 @@ def read_command(session_state=None):
                 "continue_embark, state, raw_actions, quit"
             )
             continue
+
+        if frontend_state == "inn_hire":
+            inspect_match = re.fullmatch(r"inspect_hire\s+(\d+)", text)
+            if inspect_match:
+                guid = int(inspect_match.group(1))
+                offered = {
+                    c.get("actor_guid")
+                    for c in (snapshot.get("candidates") or [])
+                    if isinstance(c, dict)
+                }
+                if guid not in offered:
+                    print("That bounty hunter is not offered at this inn.")
+                    continue
+                return {
+                    "type": "command",
+                    "action": "inn_hire_inspect",
+                    "actor_guid": guid,
+                }
+
+            if text in {"hire", "refresh"}:
+                session_state.pop("inn_hire_selected", None)
+                return {"type": "command", "action": "inn_hire_state"}
+            match = re.fullmatch(r"(?:select_hire|select)\s+(\d+)", text)
+            if match:
+                guid = int(match.group(1))
+                candidate = next((c for c in (snapshot.get("candidates") or [])
+                                  if isinstance(c, dict) and c.get("actor_guid") == guid), None)
+                if candidate is None:
+                    print("That candidate is not offered.")
+                    continue
+                session_state["inn_hire_selected"] = guid
+                print(f"Selected {candidate.get('actor_name') or candidate.get('actor_data_id')} [{guid}]")
+                print(f"  inspect_hire {guid}  - stats, skills, quirks and memories")
+                if snapshot.get("party_full"):
+                    print("Choose whom to replace:")
+                    for h in snapshot.get("party") or []:
+                        print(f"  confirm_hire {h.get('actor_guid')} — {h.get('actor_name') or h.get('actor_data_id')}")
+                else:
+                    print("  confirm_hire  (hire into vacant party slot)")
+                print("  cancel")
+                continue
+            match = re.fullmatch(r"confirm_hire(?:\s+(\d+))?", text)
+            if match:
+                selected = session_state.get("inn_hire_selected")
+                if selected is None:
+                    print("First use select_hire <actor_guid>.")
+                    continue
+                replaced = int(match.group(1) or 0)
+                valid = {(a.get("actor_guid"), a.get("replace_actor_guid"))
+                         for a in (snapshot.get("available_actions") or [])
+                         if isinstance(a, dict) and a.get("action") == "inn_hire_confirm"}
+                if (selected, replaced) not in valid:
+                    print("This hire/replacement combination is not permitted.")
+                    continue
+                session_state.pop("inn_hire_selected", None)
+                return {"type": "command", "action": "inn_hire_confirm",
+                        "actor_guid": selected, "replace_actor_guid": replaced}
+            if text in {"cancel", "back"}:
+                if session_state.pop("inn_hire_selected", None) is not None:
+                    print("Hire selection cancelled; party unchanged.")
+                    continue
+                return {"type": "command", "action": "inn_hire_back"}
 
         if frontend_state == "inn_items":
             if text in {"inn_items", "items", "refresh"}:
@@ -2578,6 +2648,30 @@ def print_frontend_snapshot(message, heading):
         print("  state")
         print("  raw_actions")
         print("  quit")
+        print()
+        return
+
+    if frontend_state == "inn":
+        offers = [a for a in (message.get("available_actions") or [])
+                  if isinstance(a, dict) and a.get("action") == "hire"]
+        print("Bounty hunter: " + ("AVAILABLE (hire)" if offers and offers[0].get("available") else "not offered"))
+        print()
+
+    if frontend_state == "inn_hire":
+        print()
+        print("Offered bounty hunters:")
+        candidates = message.get("candidates") or []
+        if not candidates:
+            print("  none")
+        for c in candidates:
+            print(f"  [{c.get('actor_guid')}] {c.get('actor_name') or '?'} ({c.get('actor_data_id') or '?'})")
+        print("Party:")
+        for h in message.get("party") or []:
+            print(f"  [{h.get('actor_guid')}] {h.get('actor_name') or h.get('actor_data_id')}")
+        print()
+        print("Commands: inspect_hire <actor_guid>, select_hire <actor_guid>,")
+        print("          confirm_hire [replaced_actor_guid],")
+        print("          cancel, hire, back, state, raw_actions, quit")
         print()
         return
 
@@ -4701,6 +4795,30 @@ def run_session(pipe):
                 "END EXPEDITION",
             )
             waiting_for_command = True
+
+        elif message_type == "inn_hire_state":
+            session_state.pop("inn_hire_selected", None)
+            hire_snapshot = {
+                "frontend_state": "inn_hire",
+                "current_mode": "inn",
+                "candidates": message.get("candidates") or [],
+                "party": message.get("party") or [],
+                "party_full": bool(message.get("party_full")),
+                "available_actions": message.get("available_actions") or [],
+            }
+            session_state["frontend_snapshot"] = hire_snapshot
+            print_frontend_snapshot(hire_snapshot, "INN BOUNTY-HUNTER HIRE")
+            waiting_for_command = True
+
+        elif message_type == "inn_hire_result":
+            print()
+            print("INN HIRE COMPLETED")
+            print(f"Hired: [{message.get('hired_actor_guid')}]")
+            print(f"Replaced: [{message.get('replaced_actor_guid')}]")
+            print("Current party:")
+            for h in message.get("party") or []:
+                print(f"  [{h.get('actor_guid')}] {h.get('actor_name') or h.get('actor_data_id')}")
+            print()
 
         elif message_type == "inn_items_state":
             session_state.pop("inn_item_preview", None)

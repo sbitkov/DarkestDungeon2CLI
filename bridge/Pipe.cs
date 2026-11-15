@@ -483,6 +483,24 @@ namespace DD2Bridge
             {
                 HandleInnRouteBack(request);
             }
+            else if (request.Command == "inn-hire-state")
+            {
+                HandleInnHireState(request);
+            }
+            else if (request.Command.StartsWith("inn-hire-inspect "))
+            {
+                HandleInnHireInspect(
+                    request, request.Command.Substring("inn-hire-inspect ".Length));
+            }
+            else if (request.Command.StartsWith("inn-hire-confirm "))
+            {
+                HandleInnHireConfirm(
+                    request, request.Command.Substring("inn-hire-confirm ".Length));
+            }
+            else if (request.Command == "inn-hire-back")
+            {
+                HandleInnHireBack(request);
+            }
             else if (request.Command == "inn-items-state")
             {
                 HandleInnItemsState(request);
@@ -2597,6 +2615,68 @@ namespace DD2Bridge
                     {
                         Command = "inn-wainwright-back"
                     });
+                return;
+            }
+
+            if (action == "hire" || action == "inn_hire_state")
+            {
+                QueueIncomingRequest(new BridgeRequest { Command = "inn-hire-state" });
+                return;
+            }
+
+            if (action == "inn_hire_inspect")
+            {
+                uint actorGuid;
+                JToken token = message["actor_guid"];
+                if (token == null ||
+                    !uint.TryParse(token.ToString(), out actorGuid) ||
+                    actorGuid == 0)
+                {
+                    QueueOutgoingMessage(new JObject
+                    {
+                        ["type"] = "error",
+                        ["code"] = "invalid_command",
+                        ["message"] = "inn_hire_inspect requires actor_guid"
+                    });
+                    return;
+                }
+                QueueIncomingRequest(new BridgeRequest
+                {
+                    Command = "inn-hire-inspect " + actorGuid
+                });
+                return;
+            }
+
+            if (action == "inn_hire_confirm")
+            {
+                uint hireGuid;
+                uint replaceGuid;
+                JToken hireToken = message["actor_guid"];
+                JToken replaceToken = message["replace_actor_guid"];
+                if (hireToken == null || replaceToken == null ||
+                    !uint.TryParse(hireToken.ToString(), out hireGuid) ||
+                    hireGuid == 0 ||
+                    !uint.TryParse(replaceToken.ToString(), out replaceGuid))
+                {
+                    QueueOutgoingMessage(new JObject
+                    {
+                        ["type"] = "error",
+                        ["code"] = "invalid_command",
+                        ["message"] = "inn_hire_confirm requires actor_guid and replace_actor_guid"
+                    });
+                    return;
+                }
+
+                QueueIncomingRequest(new BridgeRequest
+                {
+                    Command = "inn-hire-confirm " + hireGuid + " " + replaceGuid
+                });
+                return;
+            }
+
+            if (action == "inn_hire_back")
+            {
+                QueueIncomingRequest(new BridgeRequest { Command = "inn-hire-back" });
                 return;
             }
 

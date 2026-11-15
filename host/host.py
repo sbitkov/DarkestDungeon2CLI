@@ -1459,29 +1459,81 @@ def read_command(session_state=None):
 
         if frontend_state == "inn_items":
             if text in {"inn_items", "items", "refresh"}:
+                session_state.pop("inn_item_preview", None)
                 return {"type": "command", "action": "inn_items_state"}
-            use_match = re.fullmatch(r"(?:use|use_inn_item)\s+(\d+)(?:\s+(.+))?", text)
-            if use_match:
-                slot = int(use_match.group(1))
-                targets = []
-                remainder = (use_match.group(2) or "").strip()
-                if remainder:
-                    try:
-                        targets = [int(x) for x in remainder.split()]
-                    except ValueError:
-                        print("Use: use_inn_item <inventory_slot> [actor_guid ...]")
-                        continue
+
+            select_match = re.fullmatch(r"(?:select_inn_item|select)\s+(\d+)|(\d+)", text)
+            if select_match:
+                slot = int(select_match.group(1) or select_match.group(2))
+                item = next(
+                    (i for i in (snapshot.get("items") or [])
+                     if isinstance(i, dict) and i.get("slot") == slot),
+                    None,
+                )
+                if item is None:
+                    print(f"No inn item in slot {slot}.")
+                    continue
+                session_state["inn_item_preview"] = {
+                    "slot": slot,
+                    "item_id": item.get("item_id"),
+                    "quantity": item.get("quantity"),
+                }
+                _print_inn_item_preview(item, snapshot.get("available_actions") or [])
+                continue
+
+            apply_match = re.fullmatch(
+                r"(?:apply_inn_item|apply)\s*(.*)", text
+            )
+            if apply_match:
+                preview = session_state.get("inn_item_preview")
+                if not isinstance(preview, dict):
+                    print("Select an inn item first: select_inn_item <slot>.")
+                    continue
+                remainder = apply_match.group(1).strip()
+                try:
+                    targets = [int(x) for x in remainder.split()] if remainder else []
+                except ValueError:
+                    print("Use: apply_inn_item [actor_guid ...]")
+                    continue
+                slot = preview["slot"]
+                item = next(
+                    (i for i in (snapshot.get("items") or [])
+                     if isinstance(i, dict) and i.get("slot") == slot),
+                    None,
+                )
+                if (item is None or item.get("item_id") != preview["item_id"]
+                        or item.get("quantity") != preview["quantity"]):
+                    session_state.pop("inn_item_preview", None)
+                    print("Selected item has changed. Refresh and select it again.")
+                    continue
                 valid = {
                     (int(a.get("slot")), tuple(int(x) for x in (a.get("target_guids") or [])))
                     for a in (snapshot.get("available_actions") or [])
-                    if isinstance(a, dict) and a.get("action") == "inn_item_use" and a.get("slot") is not None
+                    if isinstance(a, dict) and a.get("action") == "inn_item_use"
+                    and a.get("slot") is not None
                 }
+                # For two-target items the order is immaterial.
+                if item.get("selectable_targets") == 2:
+                    targets.sort()
+                    valid = {(s, tuple(sorted(t))) for s, t in valid}
                 if (slot, tuple(targets)) not in valid:
-                    print("That inn-item/target combination is not currently available. See target restrictions or raw_actions.")
+                    print("These targets are not currently eligible. See the item preview.")
                     continue
-                return {"type":"command", "action":"inn_item_use", "slot":slot, "target_guids":targets}
-            if text == "back":
-                return {"type":"command", "action":"inn_items_back"}
+                session_state.pop("inn_item_preview", None)
+                return {
+                    "type": "command", "action": "inn_item_use",
+                    "slot": slot, "target_guids": targets,
+                }
+
+            if text in {"cancel", "back"}:
+                if session_state.pop("inn_item_preview", None) is not None:
+                    print("Inn item selection cancelled; no item consumed.")
+                    continue
+                return {"type": "command", "action": "inn_items_back"}
+
+            if re.fullmatch(r"(?:use_inn_item|use)\s+.*", text):
+                print("First select an item with select_inn_item <slot>; then apply_inn_item [actor_guid ...].")
+                continue
 
         if frontend_state == "inn_route_choice":
             if text in {"route", "path", "refresh"}:
@@ -2374,6 +2426,54 @@ def _print_map_state(message):
     print()
 
 
+def _print_inn_item_preview(item, actions):
+    """Show the same pre-use eligibility exposed by the inn item snapshot."""
+    slot = item.get("slot")
+    name = _clean_skill_text(item.get("display_name")) or item.get("item_id") or "<unknown>"
+    print()
+    print(f"INN ITEM PREVIEW — {name} (slot {slot}, x{item.get('quantity')})")
+    description = _clean_skill_text(item.get("tooltip"))
+    if description:
+        print(description)
+    required = item.get("selectable_targets")
+    if item.get("random_target"):
+        print("Random target selection")
+    print(f"Selectable targets: {required}")
+    targets = item.get("targets") or []
+    eligible = 0
+    for target in targets:
+        if not isinstance(target, dict):
+            continue
+        available = bool(target.get("available"))
+        if available:
+            eligible += 1
+        label = f"  [{target.get('actor_guid')}] {target.get('actor_name') or ''}"
+        if available:
+            label += " — ELIGIBLE"
+        else:
+            label += f" — BLOCKED ({target.get('blocked_reason') or 'unknown'})"
+            if target.get("blocked_by_id"):
+                label += f" by {target['blocked_by_id']}"
+        print(label)
+    print(f"Eligible targets: {eligible}/{len(targets)}")
+    options = [
+        a.get("target_guids") or []
+        for a in actions
+        if isinstance(a, dict) and a.get("action") == "inn_item_use"
+        and a.get("slot") == slot
+    ]
+    if not options:
+        print("No valid application available.")
+    elif required == 4:
+        print("  apply_inn_item  (group item; game determines recipients)")
+    else:
+        print("Available applications:")
+        for target_guids in options:
+            print("  apply_inn_item " + " ".join(str(x) for x in target_guids))
+    print("  cancel  (return without consuming the item)")
+    print()
+
+
 def print_frontend_snapshot(message, heading):
     frontend_state = message.get("frontend_state")
 
@@ -2491,33 +2591,14 @@ def print_frontend_snapshot(message, heading):
             if not isinstance(item, dict):
                 continue
             slot = item.get("slot")
-            item_id = item.get("item_id") or "<unknown>"
-            name = _clean_skill_text(item.get("display_name"))
-            qty = item.get("quantity")
-            line = f"  slot {slot}: {name or item_id}"
-            if name and name != item_id:
-                line += f" [{item_id}]"
-            if qty is not None:
-                line += f" x{qty}"
-            if item.get("random_target"):
-                line += " [RANDOM TARGET]"
-            print(line)
-            desc = _clean_skill_text(item.get("tooltip"))
-            for dl in desc.splitlines():
-                if dl.strip(): print(f"      {dl.strip()}")
-            print(f"      targets required: {item.get('selectable_targets')}")
-            for target in item.get("targets") or []:
-                if not isinstance(target, dict): continue
-                tline = f"        [{target.get('actor_guid')}] {target.get('actor_name') or ''}"
-                if not target.get("available"):
-                    tline += f" [BLOCKED: {target.get('blocked_reason') or 'blocked'}]"
-                    if target.get("blocked_by_id"):
-                        tline += f" by {target.get('blocked_by_id')}"
-                print(tline)
+            name = _clean_skill_text(item.get("display_name")) or item.get("item_id") or "<unknown>"
+            print(f"  slot {slot}: {name} x{item.get('quantity')}")
         print()
         print("Commands:")
-        print("  use_inn_item <inventory_slot> [actor_guid ...]")
-        print("  inn_items")
+        print("  select_inn_item <inventory_slot>  - preview eligibility (no item consumed)")
+        print("  apply_inn_item [actor_guid ...] - apply the selected item")
+        print("  cancel                          - cancel selection")
+        print("  inn_items                       - refresh")
         print("  back")
         print("  state")
         print("  raw_actions")
@@ -4622,6 +4703,7 @@ def run_session(pipe):
             waiting_for_command = True
 
         elif message_type == "inn_items_state":
+            session_state.pop("inn_item_preview", None)
             inn_items_snapshot = {
                 "frontend_state": "inn_items",
                 "current_mode": message.get("current_mode") or "inn",
@@ -4640,6 +4722,12 @@ def run_session(pipe):
             consequences = message.get("consequences") or []
             if not consequences:
                 print("  no observable state changes")
+            inn_snapshot = session_state.get("frontend_snapshot") or {}
+            actor_names = {
+                a.get("actor_guid"): (a.get("actor_name") or "")
+                for a in (inn_snapshot.get("party") or [])
+                if isinstance(a, dict)
+            }
             for c in consequences:
                 if not isinstance(c, dict):
                     print(f"  {c}")
@@ -4647,7 +4735,20 @@ def run_session(pipe):
                 ctype = c.get("type") or "change"
                 actor = c.get("actor_guid")
                 line = f"  {ctype}" + (f" actor=[{actor}]" if actor is not None else "")
-                if "delta" in c:
+                if ctype == "relationship_changed":
+                    participants = [
+                        f"{actor_names.get(guid) or 'Hero'} [{guid}]"
+                        for guid in (c.get("actor_guids") or [])
+                    ]
+                    if participants:
+                        line += " " + " + ".join(participants)
+                    line += (
+                        f" delta={c.get('delta')}"
+                        f" ({c.get('previous')} -> {c.get('current')})"
+                    )
+                    if c.get("source_type"):
+                        line += f" source={c['source_type']}"
+                elif "delta" in c:
                     line += f" delta={c.get('delta')} ({c.get('before')} -> {c.get('after')})"
                 elif ctype.startswith("quirk_"):
                     line += f" {c.get('name') or c.get('quirk_id') or ''}"

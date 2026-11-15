@@ -60,6 +60,12 @@ namespace DD2Bridge
                             ["action"] = "inn_hire_select",
                             ["actor_guid"] = guid
                         });
+                        actions.Add(new JObject
+                        {
+                            ["action"] = "inn_hire_inspect",
+                            ["actor_guid"] = guid,
+                            ["consumes_boundary"] = false
+                        });
                     }
                 }
 

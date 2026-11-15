@@ -5,6 +5,8 @@ using Assets.Code.Actor;
 using Assets.Code.Game;
 using Assets.Code.Inn;
 using Assets.Code.Inn.Presentation;
+using Assets.Code.Options;
+using Assets.Code.UI.Options;
 using Assets.Code.Roster;
 using Assets.Code.Utils;
 
@@ -20,6 +22,8 @@ namespace DD2Bridge
         private bool CanUseInnHire()
         {
             return IsStableInn() &&
+                !OptionsGame.Instance.ProfileOptions.GetBoolValue(
+                    OptionsValue.MOUNTAIN_ENABLED_IN_ALL_INNS_CONFESSIONS) &&
                 Singleton<GameTypeMgr>.Instance != null &&
                 Singleton<GameTypeMgr>.Instance.CurrentGameType == GameType.EXPEDITION &&
                 Singleton<GameTypeMgr>.Instance.RosterManager != null &&

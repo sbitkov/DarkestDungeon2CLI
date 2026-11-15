@@ -36,15 +36,11 @@ class GameSession:
         self.reader = None
 
     def _reader(self):
-        try:
-            while True:
-                line = self.pipe.readline()
-                if not line:
-                    raise BridgeDisconnected("DD2Bridge closed the Named Pipe")
-                message = json.loads(line.decode("utf-8"))
-                self.inbox.put(("message", message))
-        except Exception as exc:
-            self.inbox.put(("disconnect", str(exc)))
+        # Reuse the RC1 host's Windows PeekNamedPipe reader.  A blocking
+        # unbuffered readline() worked for the initial READY but can stall
+        # subsequent messages on Windows named pipes.
+        from host import _pipe_reader_worker
+        _pipe_reader_worker(self.pipe, self.inbox)
 
     def _connect(self):
         if self.pipe is not None:
@@ -56,6 +52,7 @@ class GameSession:
             raise BridgeDisconnected(
                 f"Cannot open DDCLI Named Pipe {self.pipe_path}: {exc}"
             ) from exc
+        self.disconnected = None
         self.reader = Thread(target=self._reader, name="ddcli-mcp-pipe", daemon=True)
         self.reader.start()
         # The bridge initially reports its authoritative READY boundary.
@@ -91,7 +88,7 @@ class GameSession:
             kind, value = self.inbox.get(timeout=remaining)
         except queue.Empty as exc:
             raise TimeoutError("No DDCLI response within the command timeout") from exc
-        if kind == "disconnect":
+        if kind in ("disconnect", "reader_error"):
             self.disconnected = value
             with suppress(Exception):
                 self.pipe.close()
@@ -106,7 +103,7 @@ class GameSession:
                 kind, value = self.inbox.get_nowait()
             except queue.Empty:
                 return
-            if kind == "disconnect":
+            if kind in ("disconnect", "reader_error"):
                 self.disconnected = value
                 with suppress(Exception):
                     self.pipe.close()

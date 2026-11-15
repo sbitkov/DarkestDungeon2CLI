@@ -134,6 +134,42 @@ namespace DD2Bridge
             request.Response = "OK";
         }
 
+        private void HandleInnHireInspect(BridgeRequest request, string args)
+        {
+            if (!CanUseInnHire())
+            {
+                request.Response = "ERROR: inn hire is not available";
+                return;
+            }
+
+            uint actorGuid;
+            if (!uint.TryParse(args, out actorGuid) || actorGuid == 0)
+            {
+                request.Response = "ERROR: inspect_hire requires actor_guid";
+                return;
+            }
+
+            IReadOnlyList<uint> offered =
+                Singleton<InnBhv>.Instance.GetHireActorGuids();
+            // Exactly the candidate that the native hunter-hire screen
+            // exposes; do not allow inspecting hidden reserve rolls.
+            if (offered.Count == 0 || offered[0] != actorGuid)
+            {
+                request.Response = "ERROR: actor is not an offered bounty hunter";
+                return;
+            }
+
+            ActorInstance actor = GetHeroActorInstance(actorGuid);
+            if (actor == null)
+            {
+                request.Response = "ERROR: offered bounty hunter unavailable";
+                return;
+            }
+
+            QueueOutgoingMessage(BuildHeroInspection(actor, "inn_hire"));
+            request.Response = "OK";
+        }
+
         private void HandleInnHireConfirm(BridgeRequest request, string args)
         {
             if (!CanUseInnHire())

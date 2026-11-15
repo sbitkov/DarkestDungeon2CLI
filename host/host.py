@@ -1462,9 +1462,9 @@ def read_command(session_state=None):
                 session_state.pop("inn_item_preview", None)
                 return {"type": "command", "action": "inn_items_state"}
 
-            select_match = re.fullmatch(r"(?:select_inn_item|select)\\s+(\\d+)", text)
+            select_match = re.fullmatch(r"(?:select_inn_item|select)\s+(\d+)|(\d+)", text)
             if select_match:
-                slot = int(select_match.group(1))
+                slot = int(select_match.group(1) or select_match.group(2))
                 item = next(
                     (i for i in (snapshot.get("items") or [])
                      if isinstance(i, dict) and i.get("slot") == slot),
@@ -1482,7 +1482,7 @@ def read_command(session_state=None):
                 continue
 
             apply_match = re.fullmatch(
-                r"(?:apply_inn_item|apply)\\s*(.*)", text
+                r"(?:apply_inn_item|apply)\s*(.*)", text
             )
             if apply_match:
                 preview = session_state.get("inn_item_preview")
@@ -1531,7 +1531,7 @@ def read_command(session_state=None):
                     continue
                 return {"type": "command", "action": "inn_items_back"}
 
-            if re.fullmatch(r"(?:use_inn_item|use)\\s+.*", text):
+            if re.fullmatch(r"(?:use_inn_item|use)\s+.*", text):
                 print("First select an item with select_inn_item <slot>; then apply_inn_item [actor_guid ...].")
                 continue
 

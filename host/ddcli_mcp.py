@@ -30,6 +30,7 @@ class GameSession:
         self.events = deque(maxlen=2048)
         self.sequence = 0
         self.snapshot = None
+        self.snapshot_sequence = 0
         self.bridge_version = None
         self.activity = None
         self.disconnected = None
@@ -77,6 +78,7 @@ class GameSession:
             # Preserve *exactly* the bridge's player-facing data, not an
             # invented or expanded interpretation of game internals.
             self.snapshot = message
+            self.snapshot_sequence = self.sequence + 1
         self.sequence += 1
         self.events.append({"sequence": self.sequence, "message": message})
 
@@ -150,10 +152,23 @@ class GameSession:
                 # control back rather than waiting for a distant READY.
                 if kind == "status" and message.get("activity") == "driving":
                     break
+            error = next((m for m in messages if m.get("type") == "error"), None)
+            # A rejected state refresh must never be presented as a fresh
+            # authoritative snapshot. The last READY remains accessible as
+            # an explicitly cached observation via ddcli_snapshot.
+            fresh = error is None and any(
+                m.get("type") in ("ready", "state") or
+                str(m.get("type", "")).endswith("_state")
+                for m in messages
+            )
             return {
                 "messages": messages,
                 "latest_sequence": self.sequence,
                 "frontend_state": (self.snapshot or {}).get("frontend_state"),
+                "frontend_state_source": "fresh" if fresh else "last_observed",
+                "snapshot_sequence": self.snapshot_sequence,
+                "refresh_succeeded": fresh,
+                "error": error,
                 "activity": self.activity,
             }
 
@@ -169,6 +184,24 @@ class GameSession:
                 "activity": self.activity,
                 "latest_sequence": self.sequence,
                 "last_disconnect": self.disconnected,
+            }
+
+    def snapshot_status(self):
+        """Return a cached player-visible boundary without sending a command."""
+        with self.lock:
+            self._connect()
+            self._drain()
+            return {
+                "snapshot": self.snapshot,
+                "snapshot_sequence": self.snapshot_sequence,
+                "latest_sequence": self.sequence,
+                "source": "last_observed",
+                "fresh_query": False,
+                "note": (
+                    "This is the most recent bridge-emitted snapshot. It is not "
+                    "a new authoritative query; call ddcli_state for a refresh "
+                    "where the bridge supports one."
+                ),
             }
 
     def events_since(self, since=0, limit=100):
@@ -216,6 +249,11 @@ def run_mcp(pipe_path):
         if action in ("quit", "raw_actions", "help"):
             raise ValueError("This is a local CLI command, not a bridge action")
         return game._exchange(action, arguments)
+
+    @mcp.tool()
+    def ddcli_snapshot() -> dict:
+        """Get the last observed READY/state, explicitly labeled cached, without querying unsupported frontends."""
+        return game.snapshot_status()
 
     @mcp.tool()
     def ddcli_events(since: int = 0, limit: int = 100) -> dict:

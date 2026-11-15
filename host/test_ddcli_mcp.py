@@ -88,6 +88,35 @@ class BridgeSessionTests(unittest.TestCase):
         self.assertFalse(cached["fresh_query"])
         self.assertEqual(cached["snapshot"]["available_actions"][0]["action"], "hire")
 
+    def test_travelogue_query_does_not_replace_inn_ready(self):
+        self.game.snapshot = {
+            "type": "ready", "frontend_state": "inn",
+            "available_actions": [{"action": "store"}, {"action": "travelogue"}],
+        }
+        self.game.snapshot_sequence = 2
+
+        class TraveloguePipe(FakePipe):
+            def write(self, data):
+                self.writes.append(json.loads(data.decode("utf-8")))
+                self.inbox.put(("message", {
+                    "type": "inn_travelogue_state",
+                    "inn_name": "The Inn", "journal": [],
+                }))
+                return len(data)
+
+        self.game.pipe = TraveloguePipe(self.game.inbox)
+        response = self.game._exchange("travelogue")
+        self.assertEqual(response["messages"][0]["type"], "inn_travelogue_state")
+        self.assertTrue(response["read_only_query"])
+        self.assertEqual(response["frontend_transition"], "none")
+        self.assertEqual(response["frontend_state"], "inn")
+        self.assertEqual(response["frontend_state_source"], "last_observed")
+        self.assertEqual(self.game.snapshot_status()["snapshot_sequence"], 2)
+        self.assertEqual(
+            self.game.snapshot_status()["snapshot"]["available_actions"][0]["action"],
+            "store",
+        )
+
     def test_disconnection_exposed(self):
         self.game.inbox.put(("disconnect", "broken pipe"))
         with self.assertRaises(RuntimeError):

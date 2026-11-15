@@ -74,9 +74,13 @@ class GameSession:
             self.activity = message.get("activity")
         if kind == "ready":
             self.activity = None
-        if isinstance(kind, str) and (kind in ("ready", "state") or kind.endswith("_state")):
-            # Preserve *exactly* the bridge's player-facing data, not an
-            # invented or expanded interpretation of game internals.
+        # An inn travelogue query is read-only. Its inn_travelogue_state
+        # payload contains journal entries, NOT a frontend decision boundary.
+        # It must not displace the last authoritative inn READY.
+        if isinstance(kind, str) and (
+            kind in ("ready", "state")
+            or (kind.endswith("_state") and kind != "inn_travelogue_state")
+        ):
             self.snapshot = message
             self.snapshot_sequence = self.sequence + 1
         self.sequence += 1
@@ -165,7 +169,19 @@ class GameSession:
                 "messages": messages,
                 "latest_sequence": self.sequence,
                 "frontend_state": (self.snapshot or {}).get("frontend_state"),
-                "frontend_state_source": "fresh" if fresh else "last_observed",
+                "frontend_state_source": (
+                    "fresh" if fresh and any(
+                        m.get("type") in ("ready", "state")
+                        or (str(m.get("type", "")).endswith("_state")
+                            and m.get("type") != "inn_travelogue_state")
+                        for m in messages
+                    ) else "last_observed"
+                ),
+                "read_only_query": action == "travelogue",
+                "frontend_transition": (
+                    "none" if action == "travelogue" and error is None
+                    else "not_determined"
+                ),
                 "snapshot_sequence": self.snapshot_sequence,
                 "refresh_succeeded": fresh,
                 "error": error,

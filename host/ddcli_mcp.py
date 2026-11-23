@@ -148,15 +148,20 @@ class GameSession:
             self._drain()
             start_sequence = self.sequence
             read_only = action in ("state", "travelogue")
-            self._send(action, arguments)
+            # A write failure can occur after some bytes reached the pipe.
+            # Treat it as an uncertain outcome, not as a safe failure.
+            transport_failure = None
+            try:
+                self._send(action, arguments)
+            except BridgeDisconnected as exc:
+                transport_failure = exc
             if not read_only:
                 self.snapshot_stale = True
 
             deadline = time.monotonic() + self.timeout
             messages = []
             response = None
-            transport_failure = None
-            while True:
+            while transport_failure is None:
                 try:
                     message = self._next(deadline)
                 except (TimeoutError, BridgeDisconnected) as exc:

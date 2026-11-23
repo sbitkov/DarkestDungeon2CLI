@@ -133,6 +133,12 @@ class GameSession:
         try:
             self.pipe.write((data + "\n").encode("utf-8"))
         except OSError as exc:
+            # The write may have been partially accepted. Retire this pipe
+            # session, but leave outcome classification to _exchange().
+            self.disconnected = str(exc)
+            with suppress(Exception):
+                self.pipe.close()
+            self.pipe = None
             raise BridgeDisconnected(f"DDCLI send failed: {exc}") from exc
 
     def _exchange(self, action, arguments=None):

@@ -185,6 +185,24 @@ class BridgeSessionTests(unittest.TestCase):
         self.assertEqual(cached["snapshot_sequence"], 7)
         self.assertEqual(cached["snapshot"]["frontend_state"], "combat")
 
+    def test_write_failure_is_uncertain_not_retryable(self):
+        class FailingPipe(FakePipe):
+            def write(self, data):
+                self.writes.append(json.loads(data.decode("utf-8")))
+                raise OSError("broken pipe during send")
+
+        self.game.pipe = FailingPipe(self.game.inbox)
+        self.game.snapshot = {"type": "ready", "frontend_state": "combat"}
+        response = self.game._exchange("skill", {
+            "performer_guid": 248,
+            "skill_id": "pass_heal",
+            "target_guid": 248,
+        })
+        self.assertEqual(response["response_kind"], "unknown")
+        self.assertFalse(response["retry_safe"])
+        self.assertTrue(response["snapshot_stale"])
+        self.assertEqual(response["error"]["code"], "command_outcome_unknown")
+
     def test_bridge_rejection_is_not_transport_unknown(self):
         class RejectingPipe(FakePipe):
             def write(self, data):

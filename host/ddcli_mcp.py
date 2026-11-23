@@ -31,6 +31,10 @@ class GameSession:
         self.sequence = 0
         self.snapshot = None
         self.snapshot_sequence = 0
+        # A cached boundary is historical after a state-changing command is sent.
+        # Only a subsequent bridge-emitted READY/state can restore its freshness.
+        self.snapshot_stale = False
+        self.last_exchange = None
         self.bridge_version = None
         self.activity = None
         self.disconnected = None
@@ -83,6 +87,7 @@ class GameSession:
         ):
             self.snapshot = message
             self.snapshot_sequence = self.sequence + 1
+            self.snapshot_stale = False
         self.sequence += 1
         self.events.append({"sequence": self.sequence, "message": message})
 
@@ -128,22 +133,55 @@ class GameSession:
         try:
             self.pipe.write((data + "\n").encode("utf-8"))
         except OSError as exc:
+            # The write may have been partially accepted. Retire this pipe
+            # session, but leave outcome classification to _exchange().
+            self.disconnected = str(exc)
+            with suppress(Exception):
+                self.pipe.close()
+            self.pipe = None
             raise BridgeDisconnected(f"DDCLI send failed: {exc}") from exc
 
     def _exchange(self, action, arguments=None):
+        """Return observed evidence, never infer exactly-once execution from a READY.
+
+        The v0.0.56 bridge does not echo a command ID. A timeout after sending
+        can mean the game executed the action but did not produce a new READY.
+        Return an explicit unknown result with all observed events instead of
+        raising and losing the event cursor. Do not automatically retry.
+        """
         with self.lock:
             self._connect()
             self._drain()
-            self._send(action, arguments)
+            start_sequence = self.sequence
+            read_only = action in ("state", "travelogue")
+            # A write failure can occur after some bytes reached the pipe.
+            # Treat it as an uncertain outcome, not as a safe failure.
+            transport_failure = None
+            try:
+                self._send(action, arguments)
+            except BridgeDisconnected as exc:
+                transport_failure = exc
+            if not read_only:
+                self.snapshot_stale = True
+
             deadline = time.monotonic() + self.timeout
             messages = []
-            while True:
-                message = self._next(deadline)
+            response = None
+            while transport_failure is None:
+                try:
+                    message = self._next(deadline)
+                except (TimeoutError, BridgeDisconnected) as exc:
+                    transport_failure = exc
+                    break
                 messages.append(message)
                 kind = message.get("type")
                 if kind == "error":
+                    response = "bridge_rejected"
                     break
-                if kind == "ready" or kind in (
+                if kind == "ready":
+                    response = "ready_observed"
+                    break
+                if kind in (
                     "state", "map_state", "hero_inspection", "inventory_state",
                     "equipment_state", "inn_hire_state", "inn_items_state",
                     "inn_route_choice_state", "inn_wainwright_state",
@@ -151,31 +189,59 @@ class GameSession:
                     "inn_travelogue_state", "inn_end_expedition_state",
                     "hospital_state", "store_state",
                 ):
+                    response = "state_observed"
                     break
-                # Driving remains interruptible. The 'status' event gives
-                # control back rather than waiting for a distant READY.
+                # Driving remains interruptible and has no terminal READY.
                 if kind == "status" and message.get("activity") == "driving":
+                    response = "activity_observed"
                     break
-            error = next((m for m in messages if m.get("type") == "error"), None)
-            # A rejected state refresh must never be presented as a fresh
-            # authoritative snapshot. The last READY remains accessible as
-            # an explicitly cached observation via ddcli_snapshot.
-            fresh = error is None and any(
-                m.get("type") in ("ready", "state") or
-                str(m.get("type", "")).endswith("_state")
+
+            bridge_error = next(
+                (m for m in messages if m.get("type") == "error"), None
+            )
+            error = bridge_error
+            if transport_failure is not None:
+                # The pipe write has returned, but completion is unconfirmed.
+                # Crucially, this is not a bridge rejection or a safe retry.
+                error = {
+                    "type": "transport_error",
+                    "code": "command_outcome_unknown",
+                    "message": str(transport_failure),
+                }
+                response = "unknown"
+
+            fresh_types = {
+                "ready", "state", "map_state", "hero_inspection",
+                "inventory_state", "equipment_state", "inn_hire_state",
+                "inn_items_state", "inn_route_choice_state",
+                "inn_wainwright_state", "inn_mastery_state",
+                "inn_store_state", "inn_travelogue_state",
+                "inn_end_expedition_state", "hospital_state", "store_state",
+            }
+            refresh_succeeded = error is None and any(
+                m.get("type") in fresh_types for m in messages
+            )
+            current_frontend_observed = any(
+                m.get("type") in ("ready", "state")
+                or (
+                    str(m.get("type", "")).endswith("_state")
+                    and m.get("type") != "inn_travelogue_state"
+                )
                 for m in messages
             )
-            return {
+            result = {
                 "messages": messages,
+                "start_sequence": start_sequence,
                 "latest_sequence": self.sequence,
+                "response_kind": response,
+                # A bridge READY is evidence of a boundary, not a correlated
+                # completion ACK for this specific action.
+                "command_completion_confirmed": False,
+                "retry_safe": read_only,
                 "frontend_state": (self.snapshot or {}).get("frontend_state"),
                 "frontend_state_source": (
-                    "fresh" if fresh and any(
-                        m.get("type") in ("ready", "state")
-                        or (str(m.get("type", "")).endswith("_state")
-                            and m.get("type") != "inn_travelogue_state")
-                        for m in messages
-                    ) else "last_observed"
+                    "fresh" if refresh_succeeded and current_frontend_observed
+                    else "last_observed"
                 ),
                 "read_only_query": action == "travelogue",
                 "frontend_transition": (
@@ -183,10 +249,24 @@ class GameSession:
                     else "not_determined"
                 ),
                 "snapshot_sequence": self.snapshot_sequence,
-                "refresh_succeeded": fresh,
+                "snapshot_stale": self.snapshot_stale,
+                "refresh_succeeded": refresh_succeeded,
                 "error": error,
                 "activity": self.activity,
             }
+            if response == "unknown":
+                result["recovery_note"] = (
+                    "Command was sent but its outcome is unknown. Do not "
+                    "blindly retry. Inspect ddcli_events(since=start_sequence) "
+                    "and request ddcli_state where supported before deciding."
+                )
+            self.last_exchange = {
+                "action": action,
+                "start_sequence": start_sequence,
+                "latest_sequence": self.sequence,
+                "response_kind": response,
+            }
+            return result
 
     def status(self):
         with self.lock:
@@ -199,6 +279,9 @@ class GameSession:
                 "frontend_state": (self.snapshot or {}).get("frontend_state"),
                 "activity": self.activity,
                 "latest_sequence": self.sequence,
+                "snapshot_sequence": self.snapshot_sequence,
+                "snapshot_stale": self.snapshot_stale,
+                "last_exchange": self.last_exchange,
                 "last_disconnect": self.disconnected,
             }
 
@@ -211,12 +294,15 @@ class GameSession:
                 "snapshot": self.snapshot,
                 "snapshot_sequence": self.snapshot_sequence,
                 "latest_sequence": self.sequence,
+                "snapshot_stale": self.snapshot_stale,
                 "source": "last_observed",
                 "fresh_query": False,
                 "note": (
                     "This is the most recent bridge-emitted snapshot. It is not "
                     "a new authoritative query; call ddcli_state for a refresh "
-                    "where the bridge supports one."
+                    "where the bridge supports one. After sending an action, "
+                    "a cached READY is not proof that the same boundary is "
+                    "still active."
                 ),
             }
 
@@ -243,8 +329,12 @@ def run_mcp(pipe_path):
     mcp = MCPServer("ddcli", instructions=(
         "Use DDCLI as your only interface for live Darkest Dungeon II game state "
         "and actions. ddcli_command sends bridge-native commands; obtain "
-        "available_actions with ddcli_state. Do not infer hidden game state. "
-        "Only one agent may control the game at a time."
+        "available_actions from READY or ddcli_state. Combat uses action='skill' "
+        "with performer_guid, skill_id, target_guid (choose a target from "
+        "the current skill's targets). A timeout means UNKNOWN execution, "
+        "not a failed action: inspect ddcli_events and fresh state before "
+        "considering another command. Cached snapshots may be stale. "
+        "Do not infer hidden game state. Only one agent may control the game."
     ))
 
     @mcp.tool()
@@ -259,7 +349,7 @@ def run_mcp(pipe_path):
 
     @mcp.tool()
     def ddcli_command(action: str, arguments: dict | None = None) -> dict:
-        """Execute a native DD2Bridge action. Pass argument fields from available_actions."""
+        """Send a bridge action. Combat: skill with performer_guid, skill_id, target_guid. A timeout returns unknown; do not retry blindly."""
         if not action or not isinstance(action, str):
             raise ValueError("action must be a nonempty string")
         if action in ("quit", "raw_actions", "help"):
